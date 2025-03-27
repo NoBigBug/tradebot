@@ -368,12 +368,18 @@ def determine_trading_strategy(df):
       - 'mean_reversion_buy': 평균회귀 매수 (횡보장에서 매수)
       - 'mean_reversion_sell': 평균회귀 매도 (횡보장에서 매도)
       - 'neutral': 거래 신호 없음
+    추가: 'neutral' 상태일 때 관망 이유를 로그에 기록함.
     """
+    reasons = []  # 관망 유지 이유를 저장할 리스트
+
     # 시장 환경 (트렌드 혹은 횡보장) 결정
     regime = determine_market_regime(df)
+    adx_value = df['adx'].iloc[-1]
     strong_trend = df['adx'].iloc[-1] > 25
     macd_line = df['macd'].iloc[-1]
     macd_signal = df['macd_signal'].iloc[-1]
+    ema_9 = df['ema_9'].iloc[-1]
+    ema_21 = df['ema_21'].iloc[-1]
     ema_uptrend = df['ema_9'].iloc[-1] > df['ema_21'].iloc[-1]
     ema_downtrend = df['ema_9'].iloc[-1] < df['ema_21'].iloc[-1]
     
@@ -395,6 +401,7 @@ def determine_trading_strategy(df):
             strategy = 'mean_reversion_buy'
         else:
             strategy = 'neutral'
+            reasons.append("횡보장 (과매수/과매도 조건 미충족)")
     else:  # trending (추세장)
         if strong_trend and macd_line > macd_signal and ema_uptrend:
             strategy = 'trend_following'
@@ -402,10 +409,21 @@ def determine_trading_strategy(df):
             strategy = 'trend_following_down'
         else:
             strategy = 'neutral'
+            if not strong_trend:
+                reasons.append(f"추세 강도 부족 (ADX: {adx_value:.2f} <= 25)")
+            if not (macd_line > macd_signal or macd_line < macd_signal):
+                reasons.append("MACD 조건 미충족")
+            if not (ema_uptrend or ema_downtrend):
+                reasons.append("EMA 추세 확인 불가")
     
     # 개선된 진입 필터: 추가 조건을 통과하지 못하면 'neutral'로 전환
     if strategy != 'neutral' and not improved_entry_filter(df, strategy):
+        reasons.append("개선된 진입 필터 미충족")
         strategy = 'neutral'
+
+    # 관망(중립) 상태라면 이유들을 로그에 출력
+    if strategy == 'neutral' and reasons:
+        logging.info("관망 상태 유지: " + ", ".join(reasons))
     
     return strategy
 
@@ -575,8 +593,6 @@ async def run_trading_bot():
                     elif strategy in ['trend_following_down', 'mean_reversion_sell']:
                         place_order(SYMBOL, SIDE_SELL, price, atr, df, strategy)
                         await send_telegram_message("📉 전략 실행: 매도 주문")
-                    else:
-                        logging.info("관망 상태 유지")
                 else:
                     if not position_alert_sent:
                         logging.info(f"이미 열린 포지션이 있음, 추가 주문 방지, strategy: {strategy}")
