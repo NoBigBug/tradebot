@@ -157,13 +157,19 @@ def calculate_support_resistance(df):
 def determine_market_regime(df):
     """
     시장의 현재 상태를 분류하는 함수
-    - ADX가 25 초과이면 강한 추세로 간주
-    - 볼린저 밴드 폭이 일정 비율(여기서는 5% 이상) 이상이면 변동성이 큰 상태로 간주
-    :return: "trending" 또는 "sideways" 문자열
+    - ADX, Bollinger Bands 폭, 그리고 EMA 간의 차이를 함께 고려하여
+      추세가 뚜렷하면 'trending'을, 그렇지 않으면 'sideways'를 반환.
     """
     adx = df['adx'].iloc[-1]
     bb_width = (df['bollinger_high'].iloc[-1] - df['bollinger_low'].iloc[-1]) / df['close'].iloc[-1]
-    if adx > 25 and bb_width > 0.05:
+    ema_9 = df['ema_9'].iloc[-1]
+    ema_21 = df['ema_21'].iloc[-1]
+
+    # EMA 간의 상대적 차이가 1% 이상이면 추세로 판단
+    if abs(ema_9 - ema_21) / ema_21 >= 0.01:
+        return "trending"
+    # ADX와 Bollinger Bands 조건도 충족하면 추세로 판단
+    elif adx > 25 and bb_width > 0.05:
         return "trending"
     else:
         return "sideways"
@@ -375,13 +381,12 @@ def determine_trading_strategy(df):
     # 시장 환경 (트렌드 혹은 횡보장) 결정
     regime = determine_market_regime(df)
     adx_value = df['adx'].iloc[-1]
-    strong_trend = df['adx'].iloc[-1] > 25
     macd_line = df['macd'].iloc[-1]
     macd_signal = df['macd_signal'].iloc[-1]
     ema_9 = df['ema_9'].iloc[-1]
     ema_21 = df['ema_21'].iloc[-1]
-    ema_uptrend = df['ema_9'].iloc[-1] > df['ema_21'].iloc[-1]
-    ema_downtrend = df['ema_9'].iloc[-1] < df['ema_21'].iloc[-1]
+    ema_uptrend = ema_9 > ema_21
+    ema_downtrend = ema_9 < ema_21
     
     # 과매도 및 과매수 조건 판단 (Stochastic Oscillator, RSI, Bollinger Bands 사용)
     oversold = (df['rsi'].iloc[-1] < 30 and
@@ -395,22 +400,25 @@ def determine_trading_strategy(df):
     # - 횡보장에서는 평균회귀 신호 위주 (과매도면 매수, 과매수면 매도)
     # - 추세장에서는 추세 추종 (상승이면 매수, 하락이면 매도)
     if regime == "sideways":
-        if overbought:
-            strategy = 'mean_reversion_sell'
-        elif oversold:
-            strategy = 'mean_reversion_buy'
+        # 추가 개선: 횡보장에서 EMA가 하락세라면 역추세 매수 신호 무시
+        if ema_downtrend:
+            reasons.append("EMA 하락세 감지: 횡보장에서 역추세 매수 무시")
+            strategy = "neutral"
         else:
-            strategy = 'neutral'
-            reasons.append("횡보장 (과매수/과매도 조건 미충족)")
+            if overbought:
+                strategy = 'mean_reversion_sell'
+            elif oversold:
+                strategy = 'mean_reversion_buy'
+            else:
+                strategy = 'neutral'
+                reasons.append("횡보장: 과매수/과매도 조건 미충족")
     else:  # trending (추세장)
-        if strong_trend and macd_line > macd_signal and ema_uptrend:
+        if macd_line > macd_signal and ema_uptrend:
             strategy = 'trend_following'
-        elif strong_trend and macd_line < macd_signal and ema_downtrend:
+        elif macd_line < macd_signal and ema_downtrend:
             strategy = 'trend_following_down'
         else:
             strategy = 'neutral'
-            if not strong_trend:
-                reasons.append(f"추세 강도 부족 (ADX: {adx_value:.2f} <= 25)")
             if not (macd_line > macd_signal or macd_line < macd_signal):
                 reasons.append("MACD 조건 미충족")
             if not (ema_uptrend or ema_downtrend):
