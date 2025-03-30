@@ -165,8 +165,8 @@ def determine_market_regime(df):
     ema_9 = df['ema_9'].iloc[-1]
     ema_21 = df['ema_21'].iloc[-1]
 
-    # EMA 간의 상대적 차이가 1% 이상이면 추세로 판단
-    if abs(ema_9 - ema_21) / ema_21 >= 0.01:
+    # EMA 간의 상대적 차이가 0.5% 이상이면 추세로 판단 (이전 1%보다 민감하게)
+    if abs(ema_9 - ema_21) / ema_21 >= 0.005:
         return "trending"
     # ADX와 Bollinger Bands 조건도 충족하면 추세로 판단
     elif adx > 25 and bb_width > 0.05:
@@ -371,14 +371,11 @@ def determine_trading_strategy(df):
     전략 종류:
       - 'trend_following': 상승 추세 추종 (롱)
       - 'trend_following_down': 하락 추세 추종 (숏)
-      - 'mean_reversion_buy': 평균회귀 매수 (횡보장에서 매수)
-      - 'mean_reversion_sell': 평균회귀 매도 (횡보장에서 매도)
+      - 'mean_reversion_buy': 평균회귀 매수 (횡보장에서 과매도 시)
+      - 'mean_reversion_sell': 평균회귀 매도 (횡보장에서 과매수 시)
       - 'neutral': 거래 신호 없음
-    추가: 'neutral' 상태일 때 관망 이유를 로그에 기록함.
     """
-    reasons = []  # 관망 유지 이유를 저장할 리스트
-
-    # 시장 환경 (트렌드 혹은 횡보장) 결정
+    reasons = []  # 관망 상태인 이유를 저장
     regime = determine_market_regime(df)
     adx_value = df['adx'].iloc[-1]
     macd_line = df['macd'].iloc[-1]
@@ -387,32 +384,17 @@ def determine_trading_strategy(df):
     ema_21 = df['ema_21'].iloc[-1]
     ema_uptrend = ema_9 > ema_21
     ema_downtrend = ema_9 < ema_21
-    
-    # 과매도 및 과매수 조건 판단 (Stochastic Oscillator, RSI, Bollinger Bands 사용)
+
+    # 과매수/과매도 조건 판단 (RSI, Stochastic, Bollinger 기준)
     oversold = (df['rsi'].iloc[-1] < 30 and
                 df['stoch_k'].iloc[-1] < df['stoch_d'].iloc[-1] and
                 df['close'].iloc[-1] <= df['bollinger_low'].iloc[-1])
     overbought = (df['rsi'].iloc[-1] > 70 and
                   df['stoch_k'].iloc[-1] > df['stoch_d'].iloc[-1] and
                   df['close'].iloc[-1] >= df['bollinger_high'].iloc[-1])
-    
-    # 시장 환경에 따른 전략 분기:
-    # - 횡보장에서는 평균회귀 신호 위주 (과매도면 매수, 과매수면 매도)
-    # - 추세장에서는 추세 추종 (상승이면 매수, 하락이면 매도)
-    if regime == "sideways":
-        # 추가 개선: 횡보장에서 EMA가 하락세라면 역추세 매수 신호 무시
-        if ema_downtrend:
-            reasons.append("EMA 하락세 감지: 횡보장에서 역추세 매수 무시")
-            strategy = "neutral"
-        else:
-            if overbought:
-                strategy = 'mean_reversion_sell'
-            elif oversold:
-                strategy = 'mean_reversion_buy'
-            else:
-                strategy = 'neutral'
-                reasons.append("횡보장: 과매수/과매도 조건 미충족")
-    else:  # trending (추세장)
+
+    if regime == "trending":
+        # 추세장에서는 MACD와 EMA의 방향을 기준으로 매매 결정
         if macd_line > macd_signal and ema_uptrend:
             strategy = 'trend_following'
         elif macd_line < macd_signal and ema_downtrend:
@@ -423,16 +405,30 @@ def determine_trading_strategy(df):
                 reasons.append("MACD 조건 미충족")
             if not (ema_uptrend or ema_downtrend):
                 reasons.append("EMA 추세 확인 불가")
-    
-    # 개선된 진입 필터: 추가 조건을 통과하지 못하면 'neutral'로 전환
+    else:  # regime == "sideways"
+        # 횡보장에서는 EMA가 상승이면 평균회귀 매도/매수 신호를 활용
+        if ema_uptrend:
+            if overbought:
+                strategy = 'mean_reversion_sell'
+            elif oversold:
+                strategy = 'mean_reversion_buy'
+            else:
+                strategy = 'neutral'
+                reasons.append("횡보장에서 과매수/과매도 조건 미충족")
+        # 횡보장이라도 EMA가 하락세라면, 하락 추세의 가능성이 있으므로 trend_following_down 적용
+        elif ema_downtrend:
+            strategy = 'trend_following_down'
+        else:
+            strategy = 'neutral'
+
+    # 개선된 진입 필터 적용 (필터 통과 실패 시 중립)
     if strategy != 'neutral' and not improved_entry_filter(df, strategy):
         reasons.append("개선된 진입 필터 미충족")
         strategy = 'neutral'
 
-    # 관망(중립) 상태라면 이유들을 로그에 출력
     if strategy == 'neutral' and reasons:
         logging.info("관망 상태 유지: " + ", ".join(reasons))
-    
+
     return strategy
 
 # =======================
