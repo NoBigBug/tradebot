@@ -201,10 +201,16 @@ def improved_entry_filter(df, strategy):
                 return False
         else:
             ratio = current_diff / previous_diff
-            # 수정: 롱 진입 조건 임계치를 0.9로 상향 조정
-            if ratio <= 0.9:
-                logging.info(f"MACD 모멘텀이 완화된 조건 미달 (롱): 비율 {ratio:.2f} <= 0.9")
+            # 수정: 롱 진입 조건 임계치를 기존 0.9에서 0.8로 완화하여 롱 진입 기회를 확대함
+            if ratio <= 0.8:
+                logging.info(f"MACD 모멘텀이 완화된 조건 미달 (롱): 비율 {ratio:.2f} <= 0.8")
                 return False
+        
+        # 수정: 롱 포지션에 대해 RSI 조건 완화 (기존 RSI > 70 대신 RSI > 80 차단)
+        rsi = df['rsi'].iloc[-1]
+        if rsi > 70:
+            logging.info(f"RSI 과매수 상태 (롱): RSI {rsi:.2f} > 70")
+            return False
 
     # 숏(매도) 포지션 조건 체크 (비율 조건은 롱과 반대)
     if strategy in ['trend_following_down', 'mean_reversion_sell']:
@@ -217,21 +223,17 @@ def improved_entry_filter(df, strategy):
             if ratio >= 1.1:
                 logging.info(f"MACD 모멘텀이 완화된 조건 미달 (숏): 비율 {ratio:.2f} >= 1.1")
                 return False
+            
+        rsi = df['rsi'].iloc[-1]
+        if rsi < 40:
+            logging.info(f"RSI 과매도 상태 (숏): RSI {rsi:.2f} < 40")
+            return False
 
     # 거래량 조건: 최근 20개 거래량의 평균과 비교하여 현재 거래량이 낮으면 진입 차단
     avg_volume = df['volume'].rolling(20).mean().iloc[-1]
     current_volume = df['volume'].iloc[-1]
     if current_volume < avg_volume:
         logging.info("거래량 부족: 현재 거래량이 평균보다 낮음")
-        return False
-
-    # RSI 조건: 과매수/과매도 판단 (롱은 RSI 60 초과, 숏은 RSI 40 미만일 때 차단)
-    rsi = df['rsi'].iloc[-1]
-    if strategy in ['trend_following', 'mean_reversion_buy'] and rsi > 70:
-        logging.info("RSI 조건 미달: 롱 진입 시 RSI가 70 초과")
-        return False
-    if strategy in ['trend_following_down', 'mean_reversion_sell'] and rsi < 40:
-        logging.info("RSI 조건 미달: 숏 진입 시 RSI가 40 미만")
         return False
 
     # OBV (On Balance Volume) 조건: 거래량 기반 모멘텀 체크
@@ -378,13 +380,15 @@ def determine_trading_strategy(df):
     """
     reasons = []  # 관망 상태인 이유를 저장
     regime = determine_market_regime(df)
-    adx_value = df['adx'].iloc[-1]
     macd_line = df['macd'].iloc[-1]
     macd_signal = df['macd_signal'].iloc[-1]
     ema_9 = df['ema_9'].iloc[-1]
     ema_21 = df['ema_21'].iloc[-1]
     ema_uptrend = ema_9 > ema_21
     ema_downtrend = ema_9 < ema_21
+
+    # 추가: 디버깅 로그로 주요 지표 확인 (롱/숏 판단에 도움)
+    logging.info(f"전략 결정 디버깅 - regime: {regime}, EMA: {ema_9:.2f}/{ema_21:.2f}, MACD: {macd_line:.2f}/{macd_signal:.2f}, RSI: {df['rsi'].iloc[-1]:.2f}")
 
     # 과매수/과매도 조건 판단 (RSI, Stochastic, Bollinger 기준)
     oversold = (df['rsi'].iloc[-1] < 30 and
@@ -395,17 +399,22 @@ def determine_trading_strategy(df):
                   df['close'].iloc[-1] >= df['bollinger_high'].iloc[-1])
 
     if regime == "trending":
-        # 추세장에서는 MACD와 EMA의 방향을 기준으로 매매 결정
-        if macd_line > macd_signal and ema_uptrend:
-            strategy = 'trend_following'
-        elif macd_line < macd_signal and ema_downtrend:
-            strategy = 'trend_following_down'
+        if ema_uptrend:
+            # 수정: 롱 진입 조건 완화 - MACD 차이가 약간 음수(-0.05 미만이면 차단)인 경우에도 롱으로 판단
+            if (macd_line - macd_signal) > -0.05:
+                strategy = 'trend_following'
+            else:
+                strategy = 'neutral'
+                reasons.append("MACD long condition not met")
+        elif ema_downtrend:
+            if macd_line < macd_signal:
+                strategy = 'trend_following_down'
+            else:
+                strategy = 'neutral'
+                reasons.append("MACD short condition not met")
         else:
             strategy = 'neutral'
-            if not (macd_line > macd_signal or macd_line < macd_signal):
-                reasons.append("MACD 조건 미충족")
-            if not (ema_uptrend or ema_downtrend):
-                reasons.append("EMA 추세 확인 불가")
+            reasons.append("EMA 추세 확인 불가")
     else:  # regime == "sideways"
         # 횡보장에서는 EMA가 상승이면 평균회귀 매도/매수 신호를 활용
         if ema_uptrend:
