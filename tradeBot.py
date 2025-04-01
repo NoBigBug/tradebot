@@ -201,8 +201,9 @@ def improved_entry_filter(df, strategy):
                 return False
         else:
             ratio = current_diff / previous_diff
-            if ratio <= 0.7:
-                logging.info(f"MACD 모멘텀이 완화된 조건 미달 (롱): 비율 {ratio:.2f} <= 0.7")
+            # 수정: 롱 진입 조건 임계치를 0.9로 상향 조정
+            if ratio <= 0.9:
+                logging.info(f"MACD 모멘텀이 완화된 조건 미달 (롱): 비율 {ratio:.2f} <= 0.9")
                 return False
 
     # 숏(매도) 포지션 조건 체크 (비율 조건은 롱과 반대)
@@ -226,8 +227,8 @@ def improved_entry_filter(df, strategy):
 
     # RSI 조건: 과매수/과매도 판단 (롱은 RSI 60 초과, 숏은 RSI 40 미만일 때 차단)
     rsi = df['rsi'].iloc[-1]
-    if strategy in ['trend_following', 'mean_reversion_buy'] and rsi > 60:
-        logging.info("RSI 조건 미달: 롱 진입 시 RSI가 60 초과")
+    if strategy in ['trend_following', 'mean_reversion_buy'] and rsi > 70:
+        logging.info("RSI 조건 미달: 롱 진입 시 RSI가 70 초과")
         return False
     if strategy in ['trend_following_down', 'mean_reversion_sell'] and rsi < 40:
         logging.info("RSI 조건 미달: 숏 진입 시 RSI가 40 미만")
@@ -417,7 +418,11 @@ def determine_trading_strategy(df):
                 reasons.append("횡보장에서 과매수/과매도 조건 미충족")
         # 횡보장이라도 EMA가 하락세라면, 하락 추세의 가능성이 있으므로 trend_following_down 적용
         elif ema_downtrend:
-            strategy = 'trend_following_down'
+            # 개선: 횡보장에서 EMA가 하락하더라도 과매도 상태이면 매수 신호 허용
+            if oversold:
+                strategy = 'mean_reversion_buy'
+            else:
+                strategy = 'trend_following_down'
         else:
             strategy = 'neutral'
 
