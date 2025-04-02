@@ -157,19 +157,34 @@ def calculate_support_resistance(df):
 def determine_market_regime(df):
     """
     시장의 현재 상태를 분류하는 함수
-    - ADX, Bollinger Bands 폭, 그리고 EMA 간의 차이를 함께 고려하여
+    - EMA 차이, ADX, Bollinger Bands 폭, MACD 히스토그램, EMA 기울기를 함께 고려하여
       추세가 뚜렷하면 'trending'을, 그렇지 않으면 'sideways'를 반환.
     """
+    # 최신 지표 값 추출
     adx = df['adx'].iloc[-1]
     bb_width = (df['bollinger_high'].iloc[-1] - df['bollinger_low'].iloc[-1]) / df['close'].iloc[-1]
     ema_9 = df['ema_9'].iloc[-1]
     ema_21 = df['ema_21'].iloc[-1]
+    ema_diff_ratio = abs(ema_9 - ema_21) / ema_21
+    
+    # MACD 히스토그램 계산: MACD와 시그널 간 차이
+    macd_hist = df['macd'].iloc[-1] - df['macd_signal'].iloc[-1]
+    
+    # EMA 기울기: 단기 EMA의 최근 변화량 (데이터가 충분할 때)
+    ema_slope = df['ema_9'].iloc[-1] - df['ema_9'].iloc[-2] if len(df) > 1 else 0
 
-    # EMA 간의 상대적 차이가 0.5% 이상이면 추세로 판단 (이전 1%보다 민감하게)
-    if abs(ema_9 - ema_21) / ema_21 >= 0.005:
-        return "trending"
-    # ADX와 Bollinger Bands 조건도 충족하면 추세로 판단
-    elif adx > 25 and bb_width > 0.05:
+    # 각 조건에 대한 임계값 적용 (임계치 충족 시 조건 만족으로 간주)
+    conditions = {
+        "ema_diff": ema_diff_ratio >= 0.003,       # EMA 차이가 0.3% 이상
+        "adx": adx > 20,                           # ADX가 20 초과
+        "bb_width": bb_width > 0.03,                # Bollinger Band 폭이 3% 이상
+        "macd_hist": abs(macd_hist) > 0.05,          # MACD 히스토그램 절대값이 0.05 이상
+        "ema_slope": abs(ema_slope) > 0.0           # EMA 기울기 변화가 (약간이라도) 존재하면
+    }
+
+    # 만족한 조건의 수를 카운트: 3개 이상의 조건이 만족되면 trending으로 판단
+    satisfied = sum(1 for key in conditions if conditions[key])
+    if satisfied >= 3:
         return "trending"
     else:
         return "sideways"
@@ -405,13 +420,13 @@ def determine_trading_strategy(df):
                 strategy = 'trend_following'
             else:
                 strategy = 'neutral'
-                reasons.append("MACD long condition not met")
+                reasons.append("MACD 롱 조건 미충족")
         elif ema_downtrend:
             if macd_line < macd_signal:
                 strategy = 'trend_following_down'
             else:
                 strategy = 'neutral'
-                reasons.append("MACD short condition not met")
+                reasons.append("MACD 숏 조건 미충족")
         else:
             strategy = 'neutral'
             reasons.append("EMA 추세 확인 불가")
