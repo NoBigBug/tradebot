@@ -1,0 +1,6 @@
+binance
+pandas
+numpy
+matplotlib
+scikit-learn
+python-telegram-bot==13.15
