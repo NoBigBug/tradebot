@@ -34,7 +34,7 @@ last_reset_month = datetime.now().month
 
 logging.basicConfig(level=logging.INFO)
 
-def get_klines(symbol='BTCUSDT', interval='5m', limit=100):
+def get_klines(symbol='BTCUSDT', interval='15m', limit=100):
     klines = client.futures_klines(symbol=symbol, interval=interval, limit=limit)
     df = pd.DataFrame(klines, columns=[
         'timestamp', 'open', 'high', 'low', 'close', 'volume',
@@ -188,9 +188,7 @@ async def trading_loop(backtest=False):
     symbol = 'BTCUSDT'
     df = get_klines(symbol=symbol)
     support, resistance, clusters = calculate_support_resistance(df)
-    if not backtest:
-        await send_telegram_message(f"🧠 BTC 지지/저항 분석\n지지선: {support}, 저항선: {resistance}")
-
+    
     current_price = float(client.futures_mark_price(symbol=symbol)['markPrice'])
     volatility = analyze_volatility(df)
 
@@ -219,10 +217,9 @@ async def trading_loop(backtest=False):
                 sl_order_id = None
             label = "🎯 TP 도달" if change_pct >= TP_PERCENT else "⚠️ SL 도달"
             await send_telegram_message(
-                f"{label}. {position_state.upper()} 종료"
-                f"PnL: {change_pct:.2f}%"
-                f"누적 PnL: {cumulative_pnl:.2f}%"
-                f"주문 정보: {order}"
+                f"{label}. {position_state.upper()} 종료\n"
+                f"PnL: {change_pct:.2f}%\n"
+                f"누적 PnL: {cumulative_pnl:.2f}%\n"
                 f"📉 포지션 종료 완료"
             )
             position_state = None
@@ -234,14 +231,17 @@ async def trading_loop(backtest=False):
         if position_state is not None:
             logging.info("중복 진입 방지: 이미 포지션이 존재함")
             return
+        
+        if not backtest:
+            await send_telegram_message(f"🧠 BTC 지지/저항 분석\n지지선: {support}, 저항선: {resistance}")
 
         order = place_order(signal, quantity)
         entry_price = current_price
         position_state = signal
         tp_order_id, sl_order_id = place_tp_sl_orders(entry_price, signal, quantity)
         await send_telegram_message(
-            f"🔥 {signal.upper()} 진입: {entry_price} USDT"
-            f"🎯 TP 예약: {round(entry_price * (1 + TP_PERCENT / 100 if signal == 'long' else 1 - TP_PERCENT / 100), 2)}"
+            f"🔥 {signal.upper()} 진입: {entry_price} USDT\n"
+            f"🎯 TP 예약: {round(entry_price * (1 + TP_PERCENT / 100 if signal == 'long' else 1 - TP_PERCENT / 100), 2)}\n"
             f"⚠️ SL 예약: {round(entry_price * (1 - SL_PERCENT / 100 if signal == 'long' else 1 + SL_PERCENT / 100), 2)}"
         )
         return
@@ -257,10 +257,9 @@ async def trading_loop(backtest=False):
         if sl_order_id:
             cancel_order(sl_order_id)
         await send_telegram_message(
-            f"❌ 신호 없음. {position_state.upper()} 종료"
-            f"PnL: {change_pct:.2f}%"
-            f"누적 PnL: {cumulative_pnl:.2f}%"
-            f"주문 정보: {order}"
+            f"❌ 신호 없음. {position_state.upper()} 종료\n"
+            f"PnL: {change_pct:.2f}%\n"
+            f"누적 PnL: {cumulative_pnl:.2f}%\n"
             f"📉 포지션 종료 완료"
         )
         position_state = None
@@ -281,7 +280,65 @@ async def start_bot():
         await asyncio.sleep(60 * 5)
 
 async def backtest_bot():
-    await trading_loop(backtest=True)
+    global position_state, entry_price, volatility_blocked, cumulative_pnl
+    global TP_PERCENT, SL_PERCENT, last_reset_month, tp_order_id, sl_order_id
+
+    df = get_klines(symbol='BTCUSDT', interval='15m', limit=1000)  # 과거 데이터 사용
+    for i in range(100, len(df)):  # 최소 100개는 있어야 분석 가능
+        sliced_df = df.iloc[:i].copy()
+
+        # 지지/저항 및 현재 정보
+        support, resistance, clusters = calculate_support_resistance(sliced_df)
+        current_price = sliced_df['close'].iloc[-1]
+        volatility = analyze_volatility(sliced_df)
+
+        current_month = pd.to_datetime(sliced_df['timestamp'].iloc[-1], unit='ms').month
+        if current_month != last_reset_month:
+            last_reset_month = current_month
+            print(f"\n🔄 새 달이 시작됨 → 누적 수익 초기화")
+            cumulative_pnl = 0.0
+
+        if cumulative_pnl <= STOP_LOSS_LIMIT:
+            print(f"\n🛑 누적 손실 {cumulative_pnl:.2f}%로 자동 중단")
+            break
+
+        TP_PERCENT, SL_PERCENT = (1.5, 0.3) if cumulative_pnl > 10 else (0.7, 0.3) if cumulative_pnl < -5 else (1.0, 0.5)
+
+        # 포지션 종료 조건 체크
+        if position_state and entry_price:
+            change_pct = (current_price - entry_price) / entry_price * 100
+            if position_state == 'short':
+                change_pct *= -1
+
+            if change_pct >= TP_PERCENT or change_pct <= -SL_PERCENT:
+                cumulative_pnl += change_pct
+                label = "🎯 TP" if change_pct >= TP_PERCENT else "⚠️ SL"
+                print(f"{label} 도달 → {position_state.upper()} 종료 | PnL: {change_pct:.2f}%, 누적: {cumulative_pnl:.2f}%")
+                position_state = None
+                entry_price = None
+                continue
+
+        # 포지션 진입 여부
+        if not volatility_blocked and position_state is None:
+            signal = should_enter_position(current_price, support, resistance)
+            if signal:
+                position_state = signal
+                entry_price = current_price
+                print(f"\n🧠 지지: {support}, 저항: {resistance}")
+                print(f"🔥 {signal.upper()} 진입 @ {entry_price} | Volatility: {volatility:.2f}%")
+                continue
+
+        # 포지션 종료 (신호 없을 경우)
+        if not should_enter_position(current_price, support, resistance) and position_state:
+            change_pct = (current_price - entry_price) / entry_price * 100
+            if position_state == 'short':
+                change_pct *= -1
+            cumulative_pnl += change_pct
+            print(f"❌ 신호 없음 → {position_state.upper()} 종료 | PnL: {change_pct:.2f}%, 누적: {cumulative_pnl:.2f}%")
+            position_state = None
+            entry_price = None
+
+    print(f"\n📊 백테스트 종료 → 최종 누적 수익률: {cumulative_pnl:.2f}%")
 
 if __name__ == "__main__":
     mode = input("실행 모드 선택 (live / backtest): ").strip()
