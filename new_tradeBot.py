@@ -115,9 +115,9 @@ def predict_trend(df: pd.DataFrame, model_path='trend_model.pkl') -> int:
     return model.predict(latest)[0]  # 1=상승, -1=하락, 0=횡보
 
 def predict_trend_text(trend: int) -> str:
-    if trend == 1:
+    if trend == 2:
         return "상승 📈"
-    elif trend == -1:
+    elif trend == 0:
         return "하락 📉"
     else:
         return "횡보 😐"
@@ -304,7 +304,7 @@ async def trading_loop(backtest=False):
             return
 
     signal = should_enter_position(current_price, support, resistance)
-    trend = predict_trend(df)
+    trend = predict_trend(df, model_path='trend_model_xgb.pkl')
     trend_text = predict_trend_text(trend)
 
     if signal:
@@ -313,13 +313,13 @@ async def trading_loop(backtest=False):
             f"🔍 진입 시도: {signal.upper()}"
         )
 
-        if trend == 0:
+        if trend == 1:
             await send_telegram_message("📉 추세가 '횡보' 상태입니다. 진입 회피합니다.")
             return
-        elif trend == 1 and signal == 'short':
+        elif trend == 2 and signal == 'short':
             await send_telegram_message("📈 추세는 상승인데 숏 진입 시도 → 회피")
             return
-        elif trend == -1 and signal == 'long':
+        elif trend == 0 and signal == 'long':
             await send_telegram_message("📉 추세는 하락인데 롱 진입 시도 → 회피")
             return
 
@@ -442,18 +442,18 @@ async def backtest_bot():
         # 포지션 진입 여부
         if not volatility_blocked and position_state is None:
             signal = should_enter_position(current_price, support, resistance)
-            trend = predict_trend_sync(sliced_df)
+            trend = predict_trend_sync(sliced_df, model_path='trend_model_xgb.pkl')
             
             if signal:
-                print(f"\n🧠 추세 예측: {'상승 📈' if trend == 1 else '하락 📉' if trend == -1 else '횡보 😐'} | 신호: {signal.upper()}")
+                print(f"\n🧠 추세 예측: {'상승 📈' if trend == 2 else '하락 📉' if trend == 0 else '횡보 😐'} | 신호: {signal.upper()}")
 
-                if trend == 0:
+                if trend == 1:
                     print("😐 횡보 추세 → 진입 회피")
                     continue
-                elif trend == 1 and signal == 'short':
+                elif trend == 2 and signal == 'short':
                     print("📈 상승 추세인데 숏 시도 → 진입 회피")
                     continue
-                elif trend == -1 and signal == 'long':
+                elif trend == 0 and signal == 'long':
                     print("📉 하락 추세인데 롱 시도 → 진입 회피")
                     continue
 
