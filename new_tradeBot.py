@@ -114,6 +114,30 @@ def predict_trend(df: pd.DataFrame, model_path='trend_model.pkl') -> int:
     latest = df[['ma_ratio', 'volatility', 'rsi']].iloc[-1:]
     return model.predict(latest)[0]  # 1=상승, -1=하락, 0=횡보
 
+def predict_trend_with_proba(df: pd.DataFrame, model_path='trend_model_xgb.pkl'):
+    from xgboost import XGBClassifier
+
+    df = df.copy()
+    df['return'] = df['close'].pct_change()
+    df['ma5'] = df['close'].rolling(window=5).mean()
+    df['ma10'] = df['close'].rolling(window=10).mean()
+    df['ma_ratio'] = df['ma5'] / df['ma10']
+    df['volatility'] = df['return'].rolling(window=5).std()
+    df['rsi'] = compute_rsi(df['close'], 14)
+    df = df.dropna()
+
+    if len(df) < 1:
+        return 1, 0.0  # 기본값: 횡보, 확률 0
+
+    features = df[['ma_ratio', 'volatility', 'rsi']].iloc[-1:]
+    model: XGBClassifier = joblib.load(model_path)
+
+    proba = model.predict_proba(features)[0]  # [하락, 횡보, 상승]
+    pred = int(np.argmax(proba))
+    confidence = float(proba[pred])
+
+    return pred, confidence
+
 def predict_trend_text(trend: int) -> str:
     if trend == 2:
         return "상승 📈"
@@ -304,12 +328,21 @@ async def trading_loop(backtest=False):
             return
 
     signal = should_enter_position(current_price, support, resistance)
-    trend = predict_trend(df, model_path='trend_model_xgb.pkl')
-    trend_text = predict_trend_text(trend)
+    # trend = predict_trend(df, model_path='trend_model_xgb.pkl')
+    # trend_text = predict_trend_text(trend)
+
+    trend, confidence = predict_trend_with_proba(df)
+    decoded_trend = {0: '하락 📉', 1: '횡보 😐', 2: '상승 📈'}[trend]
+
+    # confidence threshold 적용 예시 (60% 이상만 진입 허용) 추세만 보기위해서 일시 주석처리
+    # if confidence < 0.6:
+    #     await send_telegram_message("❌ 신뢰도 낮음 → 진입 회피")
+    #     return
 
     if signal:
         await send_telegram_message(
-            f"🧠 머신러닝 추세 예측: {trend_text}\n"
+            f"🧠 머신러닝 추세 예측: {decoded_trend}\n"
+            f"📊 신뢰도: {confidence * 100:.2f}%"
             f"🔍 진입 시도: {signal.upper()}"
         )
 
@@ -379,7 +412,25 @@ async def start_bot():
         except Exception as e:
             await send_telegram_message(f"❌ 오류 발생: {e}")
 
-def predict_trend_sync(df: pd.DataFrame, model_path='trend_model.pkl') -> int:
+# 밑에 함수를 사용하기위해 임시로 주석처리
+# def predict_trend_sync(df: pd.DataFrame, model_path='trend_model.pkl') -> int:
+#     df = df.copy()
+#     df['return'] = df['close'].pct_change()
+#     df['ma5'] = df['close'].rolling(window=5).mean()
+#     df['ma10'] = df['close'].rolling(window=10).mean()
+#     df['ma_ratio'] = df['ma5'] / df['ma10']
+#     df['volatility'] = df['return'].rolling(window=5).std()
+#     df['rsi'] = compute_rsi(df['close'], 14)
+#     df = df.dropna()
+
+#     if len(df) < 1:
+#         return 0  # 예측 불가 → 횡보로 처리
+
+#     features = df[['ma_ratio', 'volatility', 'rsi']]
+#     model = joblib.load(model_path)
+#     return model.predict(features.iloc[-1:])[0]
+
+def predict_trend_sync(df: pd.DataFrame, model_path='trend_model_xgb.pkl') -> tuple[int, float]:
     df = df.copy()
     df['return'] = df['close'].pct_change()
     df['ma5'] = df['close'].rolling(window=5).mean()
@@ -390,11 +441,16 @@ def predict_trend_sync(df: pd.DataFrame, model_path='trend_model.pkl') -> int:
     df = df.dropna()
 
     if len(df) < 1:
-        return 0  # 예측 불가 → 횡보로 처리
+        return 1, 0.0  # default: 횡보, 확률 0
 
     features = df[['ma_ratio', 'volatility', 'rsi']]
     model = joblib.load(model_path)
-    return model.predict(features.iloc[-1:])[0]
+
+    proba = model.predict_proba(features.iloc[-1:])[0]
+    pred = int(np.argmax(proba))
+    confidence = float(proba[pred])
+
+    return pred, confidence
 
 async def backtest_bot():
     global position_state, entry_price, volatility_blocked, cumulative_pnl
@@ -442,10 +498,18 @@ async def backtest_bot():
         # 포지션 진입 여부
         if not volatility_blocked and position_state is None:
             signal = should_enter_position(current_price, support, resistance)
-            trend = predict_trend_sync(sliced_df, model_path='trend_model_xgb.pkl')
+            # trend = predict_trend_sync(sliced_df, model_path='trend_model_xgb.pkl')
+            trend, confidence = predict_trend_sync(sliced_df)
+            decoded = {0: '하락 📉', 1: '횡보 😐', 2: '상승 📈'}
             
+            # 신뢰도 필터 (예: 60% 미만이면 진입 회피) 일단 수치만 보기위해서 주석처리
+            # if confidence < 0.6:
+            #     print("⚠️ 신뢰도 낮음 → 진입 회피")
+            #     continue
+
             if signal:
-                print(f"\n🧠 추세 예측: {'상승 📈' if trend == 2 else '하락 📉' if trend == 0 else '횡보 😐'} | 신호: {signal.upper()}")
+                # print(f"\n🧠 추세 예측: {'상승 📈' if trend == 2 else '하락 📉' if trend == 0 else '횡보 😐'} | 신호: {signal.upper()}")
+                print(f"🧠 추세 예측: {decoded[trend]} | 확률: {confidence*100:.2f}% | 신호: {signal.upper()}")
 
                 if trend == 1:
                     print("😐 횡보 추세 → 진입 회피")
