@@ -34,7 +34,7 @@ STOP_LOSS_LIMIT = -10.0
 last_reset_month = datetime.now().month
 
 # 트레이딩 인터벌 설정 ('1m', '3m', '5m', '15m', '30m', '1h' 등)
-TRADING_INTERVAL = '15m'  # Binance 기준 문자열
+TRADING_INTERVAL = '5m'  # Binance 기준 문자열
 
 logging.basicConfig(level=logging.INFO)
 
@@ -156,7 +156,7 @@ def calculate_support_resistance(df, n_clusters=6):
     prices = np.sort(centers[:, 0].astype(int))
     support = prices[0]
     resistance = prices[-1]
-    return support, resistance, prices
+    return support, resistance
 
 def analyze_volatility(df):
     returns = df['close'].pct_change().dropna()
@@ -190,6 +190,7 @@ def close_position(current_side: str, quantity: float):
         quantity=quantity
     )
     return order
+
 
 def get_tick_size(symbol='BTCUSDT'):
     info = client.futures_exchange_info()
@@ -262,6 +263,8 @@ async def trading_loop(backtest=False):
     global position_state, entry_price, volatility_blocked, cumulative_pnl
     global TP_PERCENT, SL_PERCENT, last_reset_month, tp_order_id, sl_order_id
 
+    symbol = 'BTCUSDT'
+
     if position_state is None and entry_price is None:
         position_state, entry_price = get_current_position()
         if position_state:
@@ -286,10 +289,8 @@ async def trading_loop(backtest=False):
 
     TP_PERCENT, SL_PERCENT = (1.5, 0.3) if cumulative_pnl > 10 else (0.7, 0.3) if cumulative_pnl < -5 else (1.0, 0.5)
 
-    symbol = 'BTCUSDT'
     df = get_klines(symbol=symbol)
-    support, resistance, clusters = calculate_support_resistance(df)
-    
+    support, resistance = calculate_support_resistance(df)
     current_price = float(client.futures_mark_price(symbol=symbol)['markPrice'])
     volatility = analyze_volatility(df)
 
@@ -302,8 +303,8 @@ async def trading_loop(backtest=False):
         await send_telegram_message(f"✅ 변동성 정상화 ({volatility:.2f}%) → 진입 가능 상태로 전환")
         volatility_blocked = False
 
-        if position_state and entry_price:
-            change_pct = (current_price - entry_price) / entry_price * 100
+    if position_state and entry_price:
+        change_pct = (current_price - entry_price) / entry_price * 100
         if position_state == 'short':
             change_pct *= -1
 
@@ -327,34 +328,46 @@ async def trading_loop(backtest=False):
             entry_price = None
             return
 
+    # 진입 조건 판단
     signal = should_enter_position(current_price, support, resistance)
-    # trend = predict_trend(df, model_path='trend_model_xgb.pkl')
-    # trend_text = predict_trend_text(trend)
 
+    # 머신러닝 추세 예측 + confidence
     trend, confidence = predict_trend_with_proba(df)
     decoded_trend = {0: '하락 📉', 1: '횡보 😐', 2: '상승 📈'}[trend]
 
-    # confidence threshold 적용 예시 (60% 이상만 진입 허용) 추세만 보기위해서 일시 주석처리
-    # if confidence < 0.6:
-    #     await send_telegram_message("❌ 신뢰도 낮음 → 진입 회피")
-    #     return
+    # TP/SL 동적 조정 (confidence 기반)
+    if confidence >= 0.8:
+        TP_PERCENT, SL_PERCENT = 1.8, 0.3
+    elif confidence >= 0.6:
+        TP_PERCENT, SL_PERCENT = 1.0, 0.5
+    else:
+        TP_PERCENT, SL_PERCENT = 0.7, 0.5
 
     if signal:
         await send_telegram_message(
             f"🧠 머신러닝 추세 예측: {decoded_trend}\n"
             f"📊 신뢰도: {confidence * 100:.2f}%"
+            f"🎯 TP: {TP_PERCENT}%, ⚠️ SL: {SL_PERCENT}%\n"
             f"🔍 진입 시도: {signal.upper()}"
         )
 
-        if trend == 1:
-            await send_telegram_message("📉 추세가 '횡보' 상태입니다. 진입 회피합니다.")
+        # confidence threshold 적용 예시 (60% 이상만 진입 허용)
+        if confidence < 0.6:
+            await send_telegram_message("❌ 신뢰도 낮음 → 진입 회피")
             return
-        elif trend == 2 and signal == 'short':
+
+        if trend == 2 and signal == 'short':
             await send_telegram_message("📈 추세는 상승인데 숏 진입 시도 → 회피")
             return
         elif trend == 0 and signal == 'long':
             await send_telegram_message("📉 추세는 하락인데 롱 진입 시도 → 회피")
             return
+        
+        # scale-in: 동일 방향 + 고신뢰
+        actual_quantity = quantity
+        if position_state == signal and confidence >= 0.85:
+            actual_quantity *= 2
+            await send_telegram_message("💹 고신뢰도 재진입 (Scale-in) → 수량 2배")
 
         if position_state is not None:
             logging.info("중복 진입 방지: 이미 포지션이 존재함")
@@ -363,10 +376,10 @@ async def trading_loop(backtest=False):
         if not backtest:
             await send_telegram_message(f"🧠 BTC 지지/저항 분석\n지지선: {support}, 저항선: {resistance}")
 
-        order = place_order(signal, quantity)
+        order = place_order(signal, actual_quantity)
         entry_price = current_price
         position_state = signal
-        tp_order_id, sl_order_id = place_tp_sl_orders(entry_price, signal, quantity)
+        tp_order_id, sl_order_id = place_tp_sl_orders(entry_price, signal, actual_quantity)
         await send_telegram_message(
             f"🔥 {signal.upper()} 진입: {entry_price} USDT\n"
             f"🎯 TP 예약: {round(entry_price * (1 + TP_PERCENT / 100 if signal == 'long' else 1 - TP_PERCENT / 100), 2)}\n"
@@ -465,7 +478,7 @@ async def backtest_bot():
         sliced_df = df.iloc[:i].copy()
 
         # 지지/저항 및 현재 정보
-        support, resistance, clusters = calculate_support_resistance(sliced_df)
+        support, resistance = calculate_support_resistance(sliced_df)
         current_price = sliced_df['close'].iloc[-1]
         volatility = analyze_volatility(sliced_df)
 
@@ -501,30 +514,41 @@ async def backtest_bot():
             # trend = predict_trend_sync(sliced_df, model_path='trend_model_xgb.pkl')
             trend, confidence = predict_trend_sync(sliced_df)
             decoded = {0: '하락 📉', 1: '횡보 😐', 2: '상승 📈'}
-            
-            # 신뢰도 필터 (예: 60% 미만이면 진입 회피) 일단 수치만 보기위해서 주석처리
-            # if confidence < 0.6:
-            #     print("⚠️ 신뢰도 낮음 → 진입 회피")
-            #     continue
-
+ 
             if signal:
                 # print(f"\n🧠 추세 예측: {'상승 📈' if trend == 2 else '하락 📉' if trend == 0 else '횡보 😐'} | 신호: {signal.upper()}")
                 print(f"🧠 추세 예측: {decoded[trend]} | 확률: {confidence*100:.2f}% | 신호: {signal.upper()}")
 
-                if trend == 1:
-                    print("😐 횡보 추세 → 진입 회피")
+                # 신뢰도 필터 (예: 60% 미만이면 진입 회피)
+                if confidence < 0.6:
+                    print("⚠️ 신뢰도 낮음 → 진입 회피")
                     continue
-                elif trend == 2 and signal == 'short':
+
+                if trend == 2 and signal == 'short':
                     print("📈 상승 추세인데 숏 시도 → 진입 회피")
                     continue
                 elif trend == 0 and signal == 'long':
                     print("📉 하락 추세인데 롱 시도 → 진입 회피")
                     continue
 
+                # ✅ TP/SL 동적 조정 (confidence 기반)
+                if confidence >= 0.8:
+                    TP_PERCENT, SL_PERCENT = 1.8, 0.3
+                elif confidence >= 0.6:
+                    TP_PERCENT, SL_PERCENT = 1.0, 0.5
+                else:
+                    TP_PERCENT, SL_PERCENT = 0.7, 0.5
+
+                # ✅ scale-in: 동일 방향 + 고신뢰
+                actual_quantity = quantity
+                if position_state == signal and confidence >= 0.85:
+                    actual_quantity *= 2
+                    print("💹 고신뢰도 재진입 (Scale-in) → 수량 2배")
+
                 position_state = signal
                 entry_price = current_price
                 print(f"\n🧠 지지: {support}, 저항: {resistance}")
-                print(f"🔥 {signal.upper()} 진입 @ {entry_price} | Volatility: {volatility:.2f}%")
+                print(f"🔥 {signal.upper()} 진입 @ {entry_price:.2f} | 수량: {actual_quantity:.3f} | TP: {TP_PERCENT}%, SL: {SL_PERCENT}%")
                 continue
 
         # 포지션 종료 (신호 없을 경우)

@@ -76,7 +76,7 @@ if __name__ == '__main__':
 
     client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
 
-    def get_klines(symbol='BTCUSDT', interval='15m', limit=1000):
+    def get_klines(symbol='BTCUSDT', interval='5m', limit=1000):
         klines = client.futures_klines(symbol=symbol, interval=interval, limit=limit)
         df = pd.DataFrame(klines, columns=[
             'timestamp', 'open', 'high', 'low', 'close', 'volume',
