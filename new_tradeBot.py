@@ -42,27 +42,28 @@ def get_next_bar_close_time(interval_str='15m', buffer_seconds=5):
     now = datetime.now(timezone.utc)
     interval_minutes = interval_to_minutes(interval_str)
 
-    # 다음 봉 마감 시각 계산
-    next_minute = (now.minute // interval_minutes + 1) * interval_minutes
-    next_bar_time = now.replace(minute=0, second=0, microsecond=0) + timedelta(minutes=next_minute)
+    # 현재 시각에서 interval 단위로 올림된 시간 계산
+    total_minutes = now.hour * 60 + now.minute
+    next_total_minutes = ((total_minutes // interval_minutes) + 1) * interval_minutes
 
-    # 시간이 60분 넘어가면 hour/day 보정
-    if next_minute >= 60:
-        next_bar_time += timedelta(hours=1)
+    # 마감 시간 계산
+    next_bar_hour = next_total_minutes // 60
+    next_bar_minute = next_total_minutes % 60
+
+    # 다음 봉의 마감 시각 (오늘 또는 내일로 넘어갈 수도 있음)
+    next_bar_time = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(hours=next_bar_hour, minutes=next_bar_minute)
 
     return (next_bar_time - now).total_seconds() + buffer_seconds
 
-def interval_to_minutes(interval: str) -> int:
-    unit = interval[-1]
-    value = int(interval[:-1])
-    if unit == 'm':
-        return value
-    elif unit == 'h':
-        return value * 60
-    elif unit == 'd':
-        return value * 60 * 24
+def interval_to_minutes(interval_str):
+    if interval_str.endswith('m'):
+        return int(interval_str[:-1])
+    elif interval_str.endswith('h'):
+        return int(interval_str[:-1]) * 60
+    elif interval_str.endswith('d'):
+        return int(interval_str[:-1]) * 1440
     else:
-        raise ValueError(f"지원하지 않는 인터벌 형식: {interval}")
+        raise ValueError("Invalid interval format")
     
 def get_auto_limit(interval: str) -> int:
     if interval == '1m':
