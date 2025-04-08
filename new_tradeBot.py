@@ -5,11 +5,13 @@ import matplotlib.pyplot as plt
 import matplotlib as mpl
 import logging
 import joblib
+import subprocess
 
 from sklearn.cluster import KMeans
 from telegram import Bot
+from telegram.request import HTTPXRequest
 from binance.client import Client
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, time
 
 from config import BINANCE_API_KEY, BINANCE_API_SECRET, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
@@ -17,7 +19,10 @@ mpl.rcParams['font.family'] = 'AppleGothic'
 mpl.rcParams['axes.unicode_minus'] = False
 
 client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
-bot = Bot(token=TELEGRAM_BOT_TOKEN)
+bot = Bot(
+    token=TELEGRAM_BOT_TOKEN,
+    request=HTTPXRequest(connect_timeout=10.0, read_timeout=10.0)
+)
 
 position_state = None
 entry_price = None
@@ -33,10 +38,44 @@ cumulative_pnl = 0.0
 STOP_LOSS_LIMIT = -10.0
 last_reset_month = datetime.now().month
 
+KST = timezone(timedelta(hours=9))
+last_retrain_date = None
+
 # 트레이딩 인터벌 설정 ('1m', '3m', '5m', '15m', '30m', '1h' 등)
 TRADING_INTERVAL = '5m'  # Binance 기준 문자열
 
 logging.basicConfig(level=logging.INFO)
+
+async def maybe_retrain_daily():
+    global last_retrain_date
+
+    now_kst = datetime.now(KST)
+    target_time = time(hour=0, minute=1)  # KST 기준 00:01
+
+    if (
+        now_kst.time() >= target_time and
+        (last_retrain_date is None or last_retrain_date < now_kst.date())
+    ):
+        await send_telegram_message("🔁 매일 정기 재학습 시작 (KST 기준)")
+        if retrain_model_by_script("train_trend_model_xgb.py"):
+            await send_telegram_message("✅ 정기 모델 재학습 완료")
+        else:
+            await send_telegram_message("❌ 모델 재학습 실패")
+        last_retrain_date = now_kst.date()
+
+def retrain_model_by_script(script_path="train_trend_model_xgb.py"):
+    try:
+        result = subprocess.run(
+            ["python", script_path],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        logging.info(f"✅ 모델 재학습 성공")
+        return True
+    except subprocess.CalledProcessError as e:
+        logging.error(f"❌ 모델 재학습 실패\n{e.stderr}")
+        return False
 
 def get_next_bar_close_time(interval_str='15m', buffer_seconds=5):
     now = datetime.now(timezone.utc)
@@ -102,20 +141,7 @@ def compute_rsi(series: pd.Series, period: int = 14):
     rsi = 100 - (100 / (1 + rs))
     return rsi
 
-def predict_trend(df: pd.DataFrame, model_path='trend_model.pkl') -> int:
-    model = joblib.load(model_path)
-    df = df.copy()
-    df['return'] = df['close'].pct_change()
-    df['ma5'] = df['close'].rolling(window=5).mean()
-    df['ma10'] = df['close'].rolling(window=10).mean()
-    df['ma_ratio'] = df['ma5'] / df['ma10']
-    df['volatility'] = df['return'].rolling(window=5).std()
-    df['rsi'] = compute_rsi(df['close'], 14)
-    df = df.dropna()
-    latest = df[['ma_ratio', 'volatility', 'rsi']].iloc[-1:]
-    return model.predict(latest)[0]  # 1=상승, -1=하락, 0=횡보
-
-def predict_trend_with_proba(df: pd.DataFrame, model_path='trend_model_xgb.pkl'):
+def predict_trend_with_proba(df: pd.DataFrame, model_path=f"trend_model_xgb_{TRADING_INTERVAL}.pkl"):
     from xgboost import XGBClassifier
 
     df = df.copy()
@@ -125,17 +151,51 @@ def predict_trend_with_proba(df: pd.DataFrame, model_path='trend_model_xgb.pkl')
     df['ma_ratio'] = df['ma5'] / df['ma10']
     df['volatility'] = df['return'].rolling(window=5).std()
     df['rsi'] = compute_rsi(df['close'], 14)
+
+    # ✅ 추가된 부분: MACD & Signal
+    ema12 = df['close'].ewm(span=12).mean()
+    ema26 = df['close'].ewm(span=26).mean()
+    df['macd'] = ema12 - ema26
+    df['macd_signal'] = df['macd'].ewm(span=9).mean()
+
+    # ✅ 추가된 부분: Bollinger Band Width
+    ma20 = df['close'].rolling(window=20).mean()
+    std20 = df['close'].rolling(window=20).std()
+    df['bb_width'] = (2 * std20) / ma20
+
     df = df.dropna()
 
     if len(df) < 1:
-        return 1, 0.0  # 기본값: 횡보, 확률 0
+        return 1, 0.0
 
-    features = df[['ma_ratio', 'volatility', 'rsi']].iloc[-1:]
-    model: XGBClassifier = joblib.load(model_path)
+    expected_features = ['ma_ratio', 'volatility', 'rsi', 'macd', 'macd_signal', 'bb_width']
+    if not all(col in df.columns for col in expected_features):
+        logging.error("❌ 필요한 feature가 누락되었습니다. 재학습이 필요할 수 있습니다.")
+        return 1, 0.0
 
-    proba = model.predict_proba(features)[0]  # [하락, 횡보, 상승]
-    pred = int(np.argmax(proba))
-    confidence = float(proba[pred])
+    features = df[expected_features].iloc[-1:]
+
+    try:
+        model = joblib.load(model_path)
+        if not hasattr(model, 'predict_proba'):
+            raise TypeError("모델이 'predict_proba'를 지원하지 않음")
+    except Exception as e:
+        logging.warning(f"⚠️ 모델 로딩 실패 또는 유효하지 않음: {e} → 외부 학습 스크립트 실행")
+        if not retrain_model_by_script("train_trend_model_xgb.py"):
+            return 1, 0.0
+        try:
+            model = joblib.load(model_path)
+        except Exception as e:
+            logging.error(f"❌ 모델 재로딩 실패: {e}")
+            return 1, 0.0
+
+    try:
+        proba = model.predict_proba(features)[0]
+        pred = int(np.argmax(proba))
+        confidence = float(proba[pred])
+    except Exception as e:
+        logging.error(f"❌ 예측 실패: {e}")
+        return 1, 0.0
 
     return pred, confidence
 
@@ -172,7 +232,7 @@ def should_enter_position(current_price, support, resistance, threshold=0.3):
     elif diff_resistance <= threshold:
         return 'short'
     return None
-
+ 
 def place_order(side: str, quantity: float):
     order = client.futures_create_order(
         symbol='BTCUSDT',
@@ -333,7 +393,8 @@ async def trading_loop(backtest=False):
     signal = should_enter_position(current_price, support, resistance)
 
     # 머신러닝 추세 예측 + confidence
-    trend, confidence = predict_trend_with_proba(df)
+    model_path = f"trend_model_xgb_{TRADING_INTERVAL}.pkl"
+    trend, confidence = predict_trend_with_proba(df, model_path=model_path)
     decoded_trend = {0: '하락 📉', 1: '횡보 😐', 2: '상승 📈'}[trend]
 
     # TP/SL 동적 조정 (confidence 기반)
@@ -355,6 +416,10 @@ async def trading_loop(backtest=False):
         # confidence threshold 적용 예시 (60% 이상만 진입 허용)
         if confidence < 0.6:
             await send_telegram_message("❌ 신뢰도 낮음 → 진입 회피")
+            return
+
+        if trend == 1:
+            await send_telegram_message("😐 머신러닝 예측: 횡보 → 진입 회피")
             return
 
         if trend == 2 and signal == 'short':
@@ -417,6 +482,7 @@ async def start_bot():
     while True:
         sleep_sec = get_next_bar_close_time(TRADING_INTERVAL)
         print(f"⏱️ 다음 봉 마감까지 {sleep_sec:.2f}초 대기...")
+        await maybe_retrain_daily()  # 매 루프마다 재학습 조건 확인
         await asyncio.sleep(sleep_sec)
 
         try:
@@ -426,25 +492,7 @@ async def start_bot():
         except Exception as e:
             await send_telegram_message(f"❌ 오류 발생: {e}")
 
-# 밑에 함수를 사용하기위해 임시로 주석처리
-# def predict_trend_sync(df: pd.DataFrame, model_path='trend_model.pkl') -> int:
-#     df = df.copy()
-#     df['return'] = df['close'].pct_change()
-#     df['ma5'] = df['close'].rolling(window=5).mean()
-#     df['ma10'] = df['close'].rolling(window=10).mean()
-#     df['ma_ratio'] = df['ma5'] / df['ma10']
-#     df['volatility'] = df['return'].rolling(window=5).std()
-#     df['rsi'] = compute_rsi(df['close'], 14)
-#     df = df.dropna()
-
-#     if len(df) < 1:
-#         return 0  # 예측 불가 → 횡보로 처리
-
-#     features = df[['ma_ratio', 'volatility', 'rsi']]
-#     model = joblib.load(model_path)
-#     return model.predict(features.iloc[-1:])[0]
-
-def predict_trend_sync(df: pd.DataFrame, model_path='trend_model_xgb.pkl') -> tuple[int, float]:
+def predict_trend_sync(df: pd.DataFrame, model_path=f"trend_model_xgb_{TRADING_INTERVAL}.pkl") -> tuple[int, float]:
     df = df.copy()
     df['return'] = df['close'].pct_change()
     df['ma5'] = df['close'].rolling(window=5).mean()
@@ -452,28 +500,73 @@ def predict_trend_sync(df: pd.DataFrame, model_path='trend_model_xgb.pkl') -> tu
     df['ma_ratio'] = df['ma5'] / df['ma10']
     df['volatility'] = df['return'].rolling(window=5).std()
     df['rsi'] = compute_rsi(df['close'], 14)
+
+    # ✅ 추가된 부분: MACD & Signal
+    ema12 = df['close'].ewm(span=12).mean()
+    ema26 = df['close'].ewm(span=26).mean()
+    df['macd'] = ema12 - ema26
+    df['macd_signal'] = df['macd'].ewm(span=9).mean()
+
+    # ✅ 추가된 부분: Bollinger Band Width
+    ma20 = df['close'].rolling(window=20).mean()
+    std20 = df['close'].rolling(window=20).std()
+    df['bb_width'] = (2 * std20) / ma20
+
     df = df.dropna()
 
     if len(df) < 1:
-        return 1, 0.0  # default: 횡보, 확률 0
+        return 1, 0.0
 
-    features = df[['ma_ratio', 'volatility', 'rsi']]
-    model = joblib.load(model_path)
+    expected_features = ['ma_ratio', 'volatility', 'rsi', 'macd', 'macd_signal', 'bb_width']
+    if not all(col in df.columns for col in expected_features):
+        logging.error("❌ 필요한 feature가 누락되었습니다. 재학습이 필요할 수 있습니다.")
+        return 1, 0.0
 
-    proba = model.predict_proba(features.iloc[-1:])[0]
-    pred = int(np.argmax(proba))
-    confidence = float(proba[pred])
+    features = df[expected_features]
+
+    try:
+        model = joblib.load(model_path)
+        if not hasattr(model, 'predict_proba'):
+            raise TypeError("모델이 'predict_proba'를 지원하지 않음")
+    except Exception as e:
+        logging.error(f"❌ 모델 로딩 실패 또는 유효하지 않음: {e}")
+        return 1, 0.0
+
+    try:
+        proba = model.predict_proba(features.iloc[-1:])[0]
+        pred = int(np.argmax(proba))
+        confidence = float(proba[pred])
+    except Exception as e:
+        logging.error(f"❌ 예측 실패: {e}")
+        return 1, 0.0
 
     return pred, confidence
 
-async def backtest_bot():
+async def run_all_backtests():
+    intervals = ['5m', '15m', '1h']
+    summary_results = {}
+
+    for interval in intervals:
+        print(f"\n🧪 [{interval}] 백테스트 시작\n")
+        pnl = await backtest_bot(interval=interval)
+        summary_results[interval] = pnl
+
+    # 결과 요약 출력
+    print("\n📊 전체 백테스트 요약\n")
+    for interval, pnl in summary_results.items():
+        sign = "+" if pnl >= 0 else ""
+        print(f"⏱ {interval:>3}  →  누적 PnL: {sign}{pnl:.2f}%")
+
+summary_results = {}
+
+async def backtest_bot(interval='5m') -> float:
     global position_state, entry_price, volatility_blocked, cumulative_pnl
     global TP_PERCENT, SL_PERCENT, last_reset_month, tp_order_id, sl_order_id
 
-    limit = get_auto_limit(TRADING_INTERVAL)
-    df = get_klines(symbol='BTCUSDT', interval=TRADING_INTERVAL, limit=limit)  # 과거 데이터 사용
+    limit = get_auto_limit(interval)
+    df = get_klines(symbol='BTCUSDT', interval=interval, limit=limit)  # 과거 데이터 사용
 
-    print(f"\n📊 백테스트 시작: {TRADING_INTERVAL} / 캔들 수: {limit}개\n")
+    print(f"\n📊 백테스트 시작: {interval} / 캔들 수: {limit}개\n")
 
     for i in range(100, len(df)):  # 최소 100개는 있어야 분석 가능
         sliced_df = df.iloc[:i].copy()
@@ -492,8 +585,19 @@ async def backtest_bot():
         if cumulative_pnl <= STOP_LOSS_LIMIT:
             print(f"\n🛑 누적 손실 {cumulative_pnl:.2f}%로 자동 중단")
             break
+        
+        model_path = f"trend_model_xgb_{interval}.pkl"
+        trend, confidence = predict_trend_sync(sliced_df, model_path=model_path)
+        
+        # TP_PERCENT, SL_PERCENT = (1.5, 0.3) if cumulative_pnl > 10 else (0.7, 0.3) if cumulative_pnl < -5 else (1.0, 0.5)
 
-        TP_PERCENT, SL_PERCENT = (1.5, 0.3) if cumulative_pnl > 10 else (0.7, 0.3) if cumulative_pnl < -5 else (1.0, 0.5)
+        # ✅ TP/SL 동적 조정 (confidence 기반)
+        if confidence >= 0.8:
+            TP_PERCENT, SL_PERCENT = 1.8, 0.3
+        elif confidence >= 0.6:
+            TP_PERCENT, SL_PERCENT = 1.0, 0.5
+        else:
+            TP_PERCENT, SL_PERCENT = 0.7, 0.5
 
         # 포지션 종료 조건 체크
         if position_state and entry_price:
@@ -513,7 +617,6 @@ async def backtest_bot():
         if not volatility_blocked and position_state is None:
             signal = should_enter_position(current_price, support, resistance)
             # trend = predict_trend_sync(sliced_df, model_path='trend_model_xgb.pkl')
-            trend, confidence = predict_trend_sync(sliced_df)
             decoded = {0: '하락 📉', 1: '횡보 😐', 2: '상승 📈'}
  
             if signal:
@@ -525,6 +628,10 @@ async def backtest_bot():
                     print("⚠️ 신뢰도 낮음 → 진입 회피")
                     continue
 
+                if trend == 1:
+                    print("😐 머신러닝 예측: 횡보 → 진입 회피")
+                    continue
+
                 if trend == 2 and signal == 'short':
                     print("📈 상승 추세인데 숏 시도 → 진입 회피")
                     continue
@@ -533,12 +640,12 @@ async def backtest_bot():
                     continue
 
                 # ✅ TP/SL 동적 조정 (confidence 기반)
-                if confidence >= 0.8:
-                    TP_PERCENT, SL_PERCENT = 1.8, 0.3
-                elif confidence >= 0.6:
-                    TP_PERCENT, SL_PERCENT = 1.0, 0.5
-                else:
-                    TP_PERCENT, SL_PERCENT = 0.7, 0.5
+                # if confidence >= 0.8:
+                #     TP_PERCENT, SL_PERCENT = 1.8, 0.3
+                # elif confidence >= 0.6:
+                #     TP_PERCENT, SL_PERCENT = 1.0, 0.5
+                # else:
+                #     TP_PERCENT, SL_PERCENT = 0.7, 0.5
 
                 # ✅ scale-in: 동일 방향 + 고신뢰
                 actual_quantity = quantity
@@ -562,11 +669,14 @@ async def backtest_bot():
             position_state = None
             entry_price = None
 
-    print(f"\n📊 백테스트 종료 → 최종 누적 수익률: {cumulative_pnl:.2f}%")
+    # print(f"\n✅ [{interval}] 백테스트 종료 → 누적 PnL: {cumulative_pnl:.2f}%\n")
+    return cumulative_pnl  # 누적 수익률 반환
 
 if __name__ == "__main__":
-    mode = input("실행 모드 선택 (live / backtest): ").strip()
+    mode = input("실행 모드 선택 (live / backtest / all_backtest): ").strip()
     if mode == "live":
         asyncio.run(start_bot())
-    else:
-        asyncio.run(backtest_bot())
+    elif mode == "backtest":
+        asyncio.run(backtest_bot(interval=TRADING_INTERVAL))
+    elif mode == "all_backtest":
+        asyncio.run(run_all_backtests())
