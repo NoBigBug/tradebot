@@ -69,6 +69,7 @@ def retrain_model_by_script(script_path="train_trend_model_xgb.py"):
             ["python", script_path],
             capture_output=True,
             text=True,
+            encoding='utf-8',
             check=True
         )
         logging.info(f"✅ 모델 재학습 성공")
