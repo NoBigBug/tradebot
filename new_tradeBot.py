@@ -621,7 +621,23 @@ async def trading_loop(backtest=False):
     order = place_order(signal, actual_quantity)
     entry_price = current_price
     position_state = signal
-    tp_order_id, sl_order_id = place_tp_sl_orders(entry_price, signal, actual_quantity)
+    # tp_order_id, sl_order_id = place_tp_sl_orders(entry_price, signal, actual_quantity)
+
+    # TP/SL 주문 재시도 로직
+    max_retry: int = 3
+    retries = 0    
+    while retries < max_retry:
+        try:
+            tp_order_id, sl_order_id = place_tp_sl_orders(entry_price, signal, actual_quantity)
+            logging.info("✅ TP/SL 주문 설정 완료")
+            break  # 성공하면 루프 종료
+        except Exception as e:
+            retries += 1
+            logging.warning(f"⚠️ TP/SL 주문 실패 (시도 {retries}/{max_retry}): {e}")
+            await asyncio.sleep(1.5)  # 살짝 대기 후 재시도
+
+    if retries == max_retry:
+        raise Exception("TP/SL 주문 재시도 실패")
 
     await send_telegram_message(
         f"🔥 {signal.upper()} 진입: {entry_price} USDT\n"
