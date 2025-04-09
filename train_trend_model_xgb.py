@@ -134,6 +134,22 @@ async def send_telegram_message_sync(message: str):
     except Exception as e:
         print(f"❌ 텔레그램 전송 실패: {e}")
 
+def get_auto_limit(interval: str) -> int:
+    if interval == '1m':
+        return 1500
+    elif interval == '5m':
+        return 1000
+    elif interval == '15m':
+        return 1000
+    elif interval == '1h':
+        return 1000
+    elif interval == '4h':
+        return 500
+    elif interval == '1d':
+        return 365
+    else:
+        return 1000  # 기본값
+
 # Binance에서 데이터 받아서 학습 실행
 if __name__ == '__main__':
     from binance.client import Client
@@ -151,10 +167,11 @@ if __name__ == '__main__':
         df['close'] = df['close'].astype(float)
         return df
 
-    timeframes = ['5m', '15m', '1h']
+    timeframes = ['1m', '5m', '15m', '1h']
 
     for tf in timeframes:
         print(f"\n⏳ {tf} 타임프레임 모델 학습 시작...")
-        df = get_klines(interval=tf, limit=1000)
+        limit = get_auto_limit(tf)
+        df = get_klines(interval=tf, limit=limit)
         model_path = f"trend_model_xgb_{tf}.pkl"
         train_trend_model(df, model_path=model_path)
