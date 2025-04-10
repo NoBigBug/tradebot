@@ -70,7 +70,7 @@ last_entry_retrain_date = None       # entry 전략 모델 재학습 마지막 �
 TRADING_INTERVAL = '5m'
 
 # 로깅 레벨 설정
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='[%(asctime)s] [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 
 # 바이낸스에서 캔들 데이터 불러오기
 def get_klines(symbol='BTCUSDT', interval=TRADING_INTERVAL, limit=100):
@@ -165,7 +165,7 @@ def predict_trend_with_proba(df: pd.DataFrame, model_path=f"trend_model_xgb_{TRA
         if not hasattr(model, 'predict_proba'):
             raise TypeError("모델이 'predict_proba'를 지원하지 않음")
     except Exception as e:
-        logging.warning(f"⚠️ 모델 로딩 실패 또는 유효하지 않음: {e} → 외부 학습 스크립트 실행")
+        logging.error(f"⚠️ 모델 로딩 실패 또는 유효하지 않음: {e} → 외부 학습 스크립트 실행")
         if not retrain_model_by_script("train_trend_model_xgb.py"):
             return 1, 0.0
         try:
@@ -287,7 +287,7 @@ async def maybe_retrain_entry_strategy():
     now_kst = datetime.now(KST)
     target_time = time(hour=0, minute=10)  # 월요일 00:10 기준
 
-    # ✅ 월요일 + 00:01 이후 + 아직 안 한 경우만 실행
+    # 월요일 + 00:10 이후 + 아직 안 한 경우만 실행
     if (
         now_kst.weekday() == 0 and  # 0 = Monday
         now_kst.time() >= target_time and
@@ -296,10 +296,10 @@ async def maybe_retrain_entry_strategy():
         try:
             await send_telegram_message("🔁 [진입 전략] 모델 재학습 시작")
 
-            # 1. 캔들 데이터 가져오기
+            # 캔들 데이터 가져오기
             df = get_klines(symbol='BTCUSDT', interval=TRADING_INTERVAL, limit=1500)
 
-            # 2. 학습 데이터셋 생성
+            # 학습 데이터셋 생성
             dataset = generate_entry_strategy_dataset(
                 df,
                 trend_model_path=f"trend_model_xgb_{TRADING_INTERVAL}.pkl"
@@ -309,10 +309,10 @@ async def maybe_retrain_entry_strategy():
                 await send_telegram_message("⚠️ 학습 데이터 부족으로 재학습 생략")
                 return
 
-            # 3. CSV 저장 (선택, 분석용)
+            # CSV 저장 (선택, 분석용)
             dataset.to_csv("entry_strategy_dataset.csv", index=False)
 
-            # 4. 모델 재학습 실행
+            # 모델 재학습 실행
             from train_entry_strategy_model_from_csv import train_entry_strategy_from_csv
             train_entry_strategy_from_csv(csv_path="entry_strategy_dataset.csv")
 
@@ -397,7 +397,6 @@ def close_position(current_side: str, quantity: float):
     )
     return order
 
-
 def get_tick_size(symbol='BTCUSDT'):
     info = client.futures_exchange_info()
     for s in info['symbols']:
@@ -444,7 +443,7 @@ def cancel_order(order_id: int):
     try:
         client.futures_cancel_order(symbol='BTCUSDT', orderId=order_id)
     except Exception as e:
-        logging.warning(f"❌ 주문 취소 실패: {e}")
+        logging.error(f"❌ 주문 취소 실패: {e}")
 
 async def send_telegram_message(message: str):
     await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
@@ -465,21 +464,6 @@ def check_existing_tp_sl_orders(symbol='BTCUSDT'):
     sl_exists = any(o['type'] == 'STOP_MARKET' and o['reduceOnly'] for o in open_orders)
     return tp_exists, sl_exists
 
-def trend_to_signal(trend: int):
-    if trend == 2:
-        return 'long'
-    elif trend == 0:
-        return 'short'
-    else:
-        return None
-
-def reverse_signal(signal: str):
-    if signal == 'long':
-        return 'short'
-    elif signal == 'short':
-        return 'long'
-    return None
-
 # 머신러닝 기반 실시간 트레이딩 로직 (loop)
 async def trading_loop(backtest=False):
     global position_state, entry_price, volatility_blocked, cumulative_pnl
@@ -488,7 +472,6 @@ async def trading_loop(backtest=False):
     symbol = 'BTCUSDT'
     trend_model_path = f"trend_model_xgb_{TRADING_INTERVAL}.pkl"
     entry_model_path = "entry_strategy_model.pkl"
-    trend_model = joblib.load(trend_model_path)
     entry_model = joblib.load(entry_model_path)
 
     def trend_to_signal(trend): return 'long' if trend == 2 else 'short' if trend == 0 else None
@@ -536,30 +519,59 @@ async def trading_loop(backtest=False):
         if position_state == 'short':
             change_pct *= -1
 
-        if change_pct >= TP_PERCENT or change_pct <= -SL_PERCENT:
+        hit_tp = change_pct >= TP_PERCENT
+        hit_sl = change_pct <= -SL_PERCENT
+
+        if hit_tp or hit_sl:
+            label = "🎯 TP 도달" if hit_tp else "⚠️ SL 도달"
+
+            try:
+                # 포지션 종료 시도
+                close_position(position_state, quantity)
+            except Exception as e:
+                logging.error(f"❌ 포지션 종료 실패: {e}")
+                await send_telegram_message(f"❌ {label} → 포지션 종료 실패: {e}")
+                return  # 종료 실패 시 다른 동작 금지
+        
+            # 예약 TP/SL 주문 취소
+            for order_name, order_id in [('TP', tp_order_id), ('SL', sl_order_id)]:
+                if order_id:
+                    try:
+                        cancel_order(order_id)
+                        logging.info(f"✅ {order_name} 주문 취소 완료")
+                    except Exception as e:
+                        logging.error(f"⚠️ {order_name} 주문 취소 실패: {e}")
+
+            # 수익률 기록 & 상태 초기화
             cumulative_pnl += change_pct
-            order = close_position(position_state, quantity)
-            if tp_order_id:
-                cancel_order(tp_order_id)
-                tp_order_id = None
-            if sl_order_id:
-                cancel_order(sl_order_id)
-                sl_order_id = None
-            label = "🎯 TP 도달" if change_pct >= TP_PERCENT else "⚠️ SL 도달"
+            position_state = None
+            entry_price = None
+            tp_order_id = None
+            sl_order_id = None
+
+            # 알림 전송
             await send_telegram_message(
-                f"{label}. {position_state.upper()} 종료\n"
+                f"{label}. {position_state or 'UNKNOWN'} 종료\n"
                 f"PnL: {change_pct:.2f}%\n"
                 f"누적 PnL: {cumulative_pnl:.2f}%\n"
                 f"📉 포지션 종료 완료"
             )
-            position_state = None
-            entry_price = None
+
             return
+
+    # 중복 진입 방지
+    if position_state is not None:
+        logging.info("중복 진입 방지: 이미 포지션이 존재함")
+        return
 
     # 머신러닝 추세 예측
     trend, confidence = predict_trend_with_proba(df, model_path=trend_model_path)
     if trend == 1:
         logging.info("😐 횡보 예측 → 진입 회피")
+        return
+
+    if confidence < 0.6:
+        await send_telegram_message("❌ 신뢰도 낮음 → 진입 회피")
         return
 
     # entry 전략 예측을 위한 feature 생성
@@ -593,20 +605,11 @@ async def trading_loop(backtest=False):
         f"🔍 진입 시도: {signal.upper()}"
     )
 
-    if confidence < 0.6:
-        await send_telegram_message("❌ 신뢰도 낮음 → 진입 회피")
-        return
-
     if trend == 2 and signal == 'short':
         await send_telegram_message("📈 상승 추세인데 숏 진입 시도 → 회피")
         return
     elif trend == 0 and signal == 'long':
         await send_telegram_message("📉 하락 추세인데 롱 진입 시도 → 회피")
-        return
-
-    # 중복 진입 방지
-    if position_state is not None:
-        logging.info("중복 진입 방지: 이미 포지션이 존재함")
         return
 
     # 고신뢰도일 경우 스케일 인
@@ -618,26 +621,40 @@ async def trading_loop(backtest=False):
     if not backtest:
         await send_telegram_message(f"🧠 BTC 지지/저항 분석\n지지선: {support}, 저항선: {resistance}")
 
+    # 포지션 진입
     order = place_order(signal, actual_quantity)
-    entry_price = current_price
-    position_state = signal
-    # tp_order_id, sl_order_id = place_tp_sl_orders(entry_price, signal, actual_quantity)
+    await asyncio.sleep(0.5)  # 체결 대기 (Binance 응답 속도 고려)
+
+    # 실제 체결된 진입 가격 및 방향 확인
+    position_side, real_entry_price = get_current_position()
+    
+    # 포지션 진입 실패한 경우
+    if not position_side:
+        await send_telegram_message("❌ 포지션 진입 실패 감지 → 트레이딩 스킵")
+        return
 
     # TP/SL 주문 재시도 로직
     max_retry: int = 3
     retries = 0    
     while retries < max_retry:
         try:
-            tp_order_id, sl_order_id = place_tp_sl_orders(entry_price, signal, actual_quantity)
+            tp_order_id, sl_order_id = place_tp_sl_orders(real_entry_price, signal, actual_quantity)
             logging.info("✅ TP/SL 주문 설정 완료")
             break  # 성공하면 루프 종료
         except Exception as e:
             retries += 1
-            logging.warning(f"⚠️ TP/SL 주문 실패 (시도 {retries}/{max_retry}): {e}")
+            logging.error(f"⚠️ TP/SL 주문 실패 (시도 {retries}/{max_retry}): {e}")
             await asyncio.sleep(1.5)  # 살짝 대기 후 재시도
 
+    # TP/SL 재시도 실패 → 포지션 종료 + 경고
     if retries == max_retry:
-        raise Exception("TP/SL 주문 재시도 실패")
+        await send_telegram_message("🚨 TP/SL 주문 실패 → 포지션 강제 종료")
+        close_position(signal, actual_quantity)
+        return
+
+    # 5. 모든 게 정상이면 상태 저장
+    position_state = signal
+    entry_price = real_entry_price
 
     await send_telegram_message(
         f"🔥 {signal.upper()} 진입: {entry_price} USDT\n"
@@ -646,16 +663,16 @@ async def trading_loop(backtest=False):
     )
 
 async def start_bot():
-    print("⏳ 프로그램 시작됨. 다음 봉 마감까지 대기 중...")
+    await send_telegram_message(f"⏳ 프로그램 시작.")
+    logging.info("⏳ 프로그램 시작됨. 다음 봉 마감까지 대기 중...")
 
     while True:
-        sleep_sec = get_next_bar_close_time(TRADING_INTERVAL)
-        print(f"⏱️ 다음 봉 마감까지 {sleep_sec:.2f}초 대기...")
-
-        # ✅ 매 루프마다 재학습 조건 확인
         await maybe_retrain_daily()                # 기존 trend 모델 재학습
-        await maybe_retrain_entry_strategy()       # 새로운 entry 전략 모델 재학습
+        await maybe_retrain_entry_strategy()       # 새로운 entry 전략 모델 재학습    
 
+        # 다음 봉 마감 시점 계산 (예: 현재 시각이 09:14:53 → 09:15:00 마감까지 7초 남음)
+        sleep_sec = get_next_bar_close_time(TRADING_INTERVAL)
+        logging.info(f"⏱️ 다음 봉 마감까지 {sleep_sec:.2f}초 대기...")
         await asyncio.sleep(sleep_sec)
 
         try:
@@ -674,13 +691,13 @@ def predict_trend_sync(df: pd.DataFrame, model_path=f"trend_model_xgb_{TRADING_I
     df['volatility'] = df['return'].rolling(window=5).std()
     df['rsi'] = compute_rsi(df['close'], 14)
 
-    # ✅ 추가된 부분: MACD & Signal
+    # 추가된 부분: MACD & Signal
     ema12 = df['close'].ewm(span=12).mean()
     ema26 = df['close'].ewm(span=26).mean()
     df['macd'] = ema12 - ema26
     df['macd_signal'] = df['macd'].ewm(span=9).mean()
 
-    # ✅ 추가된 부분: Bollinger Band Width
+    # 추가된 부분: Bollinger Band Width
     ma20 = df['close'].rolling(window=20).mean()
     std20 = df['close'].rolling(window=20).std()
     df['bb_width'] = (2 * std20) / ma20
@@ -720,15 +737,15 @@ async def run_all_backtests():
     summary_results = {}
 
     for interval in intervals:
-        print(f"\n🧪 [{interval}] 백테스트 시작\n")
+        logging.info(f"\n🧪 [{interval}] 백테스트 시작\n")
         pnl = await backtest_bot(interval=interval)
         summary_results[interval] = pnl
 
     # 결과 요약 출력
-    print("\n📊 전체 백테스트 요약\n")
+    logging.info("\n📊 전체 백테스트 요약\n")
     for interval, pnl in summary_results.items():
         sign = "+" if pnl >= 0 else ""
-        print(f"⏱ {interval:>3}  →  누적 PnL: {sign}{pnl:.2f}%")
+        logging.info(f"⏱ {interval:>3}  →  누적 PnL: {sign}{pnl:.2f}%")
 
 def predict_entry_strategy_from_row(row: pd.Series, model_path: str):
     import joblib
@@ -747,7 +764,7 @@ async def backtest_bot(interval='5m') -> float:
 
     limit = get_auto_limit(interval)
     df = get_klines(symbol='BTCUSDT', interval=interval, limit=limit)
-    print(f"\n📊 백테스트 시작: {interval} / 캔들 수: {limit}개\n")
+    logging.info(f"\n📊 백테스트 시작: {interval} / 캔들 수: {limit}개\n")
 
     trend_model_path = f"trend_model_xgb_{interval}.pkl"
     entry_model_path = "entry_strategy_model.pkl"
@@ -770,10 +787,10 @@ async def backtest_bot(interval='5m') -> float:
         if current_month != last_reset_month:
             last_reset_month = current_month
             cumulative_pnl = 0.0
-            print(f"\n🔄 새 달 시작 → 누적 수익 초기화")
+            logging.info(f"\n🔄 새 달 시작 → 누적 수익 초기화")
 
         if cumulative_pnl <= STOP_LOSS_LIMIT:
-            print(f"\n🛑 누적 손실 {cumulative_pnl:.2f}%로 자동 종료")
+            logging.info(f"\n🛑 누적 손실 {cumulative_pnl:.2f}%로 자동 종료")
             break
 
         support, resistance = calculate_support_resistance(sliced_df)
@@ -806,15 +823,15 @@ async def backtest_bot(interval='5m') -> float:
             continue
 
         if confidence < 0.6:
-            print("⚠️ 신뢰도 낮음 → 진입 회피")
+            logging.info("⚠️ 신뢰도 낮음 → 진입 회피")
             continue
 
         # 실전 불일치 필터
         if trend == 2 and signal == 'short':
-            print("📈 상승 추세인데 숏 진입 시도 → 회피")
+            logging.info("📈 상승 추세인데 숏 진입 시도 → 회피")
             continue
         elif trend == 0 and signal == 'long':
-            print("📉 하락 추세인데 롱 진입 시도 → 회피")
+            logging.info("📉 하락 추세인데 롱 진입 시도 → 회피")
             continue
 
         # 포지션 종료 조건
@@ -826,7 +843,7 @@ async def backtest_bot(interval='5m') -> float:
             if change_pct >= TP_PERCENT or change_pct <= -SL_PERCENT:
                 cumulative_pnl += change_pct
                 label = "🎯 TP" if change_pct >= TP_PERCENT else "⚠️ SL"
-                print(f"{label} 도달 → {position_state.upper()} 종료 | PnL: {change_pct:.2f}%, 누적: {cumulative_pnl:.2f}%")
+                logging.info(f"{label} 도달 → {position_state.upper()} 종료 | PnL: {change_pct:.2f}%, 누적: {cumulative_pnl:.2f}%")
                 position_state = None
                 entry_price = None
                 continue
@@ -836,12 +853,12 @@ async def backtest_bot(interval='5m') -> float:
             actual_quantity = quantity
             if confidence >= 0.85:
                 actual_quantity *= 2
-                print("💹 고신뢰도 재진입 (Scale-in) → 수량 2배")
+                logging.info("💹 고신뢰도 재진입 (Scale-in) → 수량 2배")
 
             position_state = signal
             entry_price = current_price
-            print(f"\n🧠 {timestamp} | 추세: {trend} / 전략: {'추세' if strategy == 1 else '역추세'} / 방향: {signal.upper()} / 신뢰도: {confidence:.2f}")
-            print(f"🔥 진입 @ {entry_price:.2f} | TP: {TP_PERCENT}%, SL: {SL_PERCENT}%")
+            logging.info(f"\n🧠 {timestamp} | 추세: {trend} / 전략: {'추세' if strategy == 1 else '역추세'} / 방향: {signal.upper()} / 신뢰도: {confidence:.2f}")
+            logging.info(f"🔥 진입 @ {entry_price:.2f} | TP: {TP_PERCENT}%, SL: {SL_PERCENT}%")
             continue
 
         # 포지션 종료: 진입 조건 소멸
@@ -850,11 +867,11 @@ async def backtest_bot(interval='5m') -> float:
             if position_state == 'short':
                 change_pct *= -1
             cumulative_pnl += change_pct
-            print(f"❌ 신호 없음 → {position_state.upper()} 종료 | PnL: {change_pct:.2f}%, 누적: {cumulative_pnl:.2f}%")
+            logging.info(f"❌ 신호 없음 → {position_state.upper()} 종료 | PnL: {change_pct:.2f}%, 누적: {cumulative_pnl:.2f}%")
             position_state = None
             entry_price = None
 
-    print(f"\n✅ 백테스트 종료 → 최종 누적 PnL: {cumulative_pnl:.2f}%\n")
+    logging.info(f"\n✅ 백테스트 종료 → 최종 누적 PnL: {cumulative_pnl:.2f}%\n")
     return cumulative_pnl
 
 if __name__ == "__main__":
