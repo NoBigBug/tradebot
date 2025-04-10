@@ -480,10 +480,7 @@ async def trading_loop(backtest=False):
     if position_state is None and entry_price is None:
         position_state, entry_price = get_current_position()
         if position_state:
-            await send_telegram_message(
-                f"🔁 기존 포지션 복구: {position_state.upper()} @ {entry_price}\n"
-                f"❗ 예약된 TP/SL 주문을 확인 중..."
-            )
+            await send_telegram_message(f"🔁 기존 포지션 복구: {position_state.upper()} @ {entry_price}")
             tp_exists, sl_exists = check_existing_tp_sl_orders()
             if not tp_exists or not sl_exists:
                 tp_order_id, sl_order_id = place_tp_sl_orders(entry_price, position_state, quantity)
