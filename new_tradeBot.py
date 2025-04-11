@@ -50,7 +50,7 @@ position_state = None  # 현재 포지션: 'long', 'short', 또는 None
 entry_price = None     # 진입 가격
 tp_order_id = None     # TP 주문 ID
 sl_order_id = None     # SL 주문 ID
-quantity = 0.05        # 거래 수량 (예: 0.05 BTC)
+quantity = 0.1        # 거래 수량 (예: 0.05 BTC)
 
 # 전략 설정 (기본 TP/SL 및 리스크 제한)
 TP_PERCENT = 1.0        # 목표 수익률 (Take Profit)
@@ -273,11 +273,11 @@ async def maybe_retrain_daily():
         now_kst.time() >= target_time and
         (last_retrain_date is None or last_retrain_date < now_kst.date())
     ):
-        await send_telegram_message("🔁 매일 정기 재학습 시작 (KST 기준)")
+        await send_telegram_message("🔁 매일 Trend 모델 재학습 시작")
         if retrain_model_by_script("train_trend_model_xgb.py"):
-            await send_telegram_message("✅ 정기 모델 재학습 완료")
+            await send_telegram_message("✅ Trend 모델 재학습 완료")
         else:
-            await send_telegram_message("❌ 모델 재학습 실패")
+            await send_telegram_message("❌ Trend 모델 재학습 실패")
         last_retrain_date = now_kst.date()
 
 # 매주 월요일 00:10 entry 전략 재학습
@@ -294,7 +294,7 @@ async def maybe_retrain_entry_strategy():
         (last_entry_retrain_date is None or last_entry_retrain_date < now_kst.date())
     ):
         try:
-            await send_telegram_message("🔁 [진입 전략] 모델 재학습 시작")
+            await send_telegram_message("🔁 매주 월요일 전략 모델 재학습 시작")
 
             # 캔들 데이터 가져오기
             df = get_klines(symbol='BTCUSDT', interval=TRADING_INTERVAL, limit=1500)
@@ -316,11 +316,11 @@ async def maybe_retrain_entry_strategy():
             from train_entry_strategy_model_from_csv import train_entry_strategy_from_csv
             train_entry_strategy_from_csv(csv_path="entry_strategy_dataset.csv")
 
-            await send_telegram_message("✅ [진입 전략] 모델 재학습 완료")
+            await send_telegram_message("✅ 전략 모델 재학습 완료")
             last_entry_retrain_date = now_kst.date()
 
         except Exception as e:
-            await send_telegram_message(f"❌ 진입 전략 재학습 실패: {e}")
+            await send_telegram_message(f"❌ 전략 모델 재학습 실패: {e}")
 
 def retrain_model_by_script(script_path="train_trend_model_xgb.py"):
     try:
@@ -622,7 +622,7 @@ async def trading_loop(backtest=False):
 
     # 포지션 진입
     order = place_order(signal, actual_quantity)
-    await asyncio.sleep(0.5)  # 체결 대기 (Binance 응답 속도 고려)
+    await asyncio.sleep(2)  # 체결 대기 (Binance 응답 속도 고려)
 
     # 실제 체결된 진입 가격 및 방향 확인
     position_side, real_entry_price = get_current_position()
@@ -655,11 +655,17 @@ async def trading_loop(backtest=False):
     position_state = signal
     entry_price = real_entry_price
 
+    # ✅ 진입 알림을 이 시점에 바로 보냄 (누락 방지)
+    tp_price = round(entry_price * (1 + TP_PERCENT / 100), 2) if signal == 'long' else round(entry_price * (1 - TP_PERCENT / 100), 2)
+    sl_price = round(entry_price * (1 - SL_PERCENT / 100), 2) if signal == 'long' else round(entry_price * (1 + SL_PERCENT / 100), 2)
+
     await send_telegram_message(
         f"🔥 {signal.upper()} 진입: {entry_price} USDT\n"
-        f"🎯 TP 예약: {round(entry_price * (1 + TP_PERCENT / 100 if signal == 'long' else 1 - TP_PERCENT / 100), 2)}\n"
-        f"⚠️ SL 예약: {round(entry_price * (1 - SL_PERCENT / 100 if signal == 'long' else 1 + SL_PERCENT / 100), 2)}"
+        f"🎯 TP 예약: {tp_price}\n"
+        f"⚠️ SL 예약: {sl_price}"
     )
+
+    logging.info("✅ 진입 알림 전송 완료")
 
 async def start_bot():
     await send_telegram_message(f"⏳ 프로그램 시작.")
