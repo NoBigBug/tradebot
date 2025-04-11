@@ -441,9 +441,24 @@ def place_tp_sl_orders(entry_price: float, side: str, quantity: float):
 
 def cancel_order(order_id: int):
     try:
+        # 현재 열려 있는 주문 목록 조회
+        open_orders = client.futures_get_open_orders(symbol='BTCUSDT')
+        valid_ids = [int(o['orderId']) for o in open_orders]
+
+        # 이미 체결되었거나 취소된 주문은 무시
+        if order_id not in valid_ids:
+            logging.info(f"ℹ️ 주문 ID {order_id}는 이미 체결되었거나 취소된 상태입니다.")
+            return
+
+        # 주문 취소 시도
         client.futures_cancel_order(symbol='BTCUSDT', orderId=order_id)
+        logging.info(f"✅ 주문 ID {order_id} 취소 완료")
+
     except Exception as e:
-        logging.error(f"❌ 주문 취소 실패: {e}")
+        if "code=-2011" in str(e):
+            logging.warning(f"⚠️ 주문 ID {order_id}는 이미 사라진 주문입니다.")
+        else:
+            logging.error(f"❌ 주문 취소 실패: {e}")
 
 async def send_telegram_message(message: str):
     await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
@@ -533,26 +548,28 @@ async def trading_loop(backtest=False):
             # 예약 TP/SL 주문 취소
             for order_name, order_id in [('TP', tp_order_id), ('SL', sl_order_id)]:
                 if order_id:
-                    try:
-                        cancel_order(order_id)
-                        logging.info(f"✅ {order_name} 주문 취소 완료")
-                    except Exception as e:
-                        logging.error(f"⚠️ {order_name} 주문 취소 실패: {e}")
+                    cancel_order(order_id)
 
-            # 수익률 기록 & 상태 초기화
+            # 수익률 기록
             cumulative_pnl += change_pct
-            position_state = None
-            entry_price = None
-            tp_order_id = None
-            sl_order_id = None
 
             # 알림 전송
             await send_telegram_message(
-                f"{label}. {position_state or 'UNKNOWN'} 종료\n"
+                f"{label}. {position_state.upper()} 종료\n"
                 f"PnL: {change_pct:.2f}%\n"
                 f"누적 PnL: {cumulative_pnl:.2f}%\n"
                 f"📉 포지션 종료 완료"
             )
+
+            # 상태 초기화
+            
+            position_state = None
+            entry_price = None
+            tp_order_id = None
+            sl_order_id = None      
+
+            await asyncio.sleep(1.0)      
+            await send_telegram_message("✅ 포지션 종료 후 상태 초기화 및 대기 완료")
 
             return
 
@@ -568,7 +585,7 @@ async def trading_loop(backtest=False):
         return
 
     if confidence < 0.6:
-        await send_telegram_message("❌ 신뢰도 낮음 → 진입 회피")
+        logging.info(f"❌ 신뢰도 낮음({confidence * 100:.2f}%) → 진입 회피")
         return
 
     # entry 전략 예측을 위한 feature 생성
