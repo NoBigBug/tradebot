@@ -439,26 +439,12 @@ def place_tp_sl_orders(entry_price: float, side: str, quantity: float):
 
     return tp_order['orderId'], sl_order['orderId']
 
-def cancel_order(order_id: int):
+def cancel_order(symbol: str):
     try:
-        # 현재 열려 있는 주문 목록 조회
-        open_orders = client.futures_get_open_orders(symbol='BTCUSDT')
-        valid_ids = [int(o['orderId']) for o in open_orders]
-
-        # 이미 체결되었거나 취소된 주문은 무시
-        if order_id not in valid_ids:
-            logging.info(f"ℹ️ 주문 ID {order_id}는 이미 체결되었거나 취소된 상태입니다.")
-            return
-
-        # 주문 취소 시도
-        client.futures_cancel_order(symbol='BTCUSDT', orderId=order_id)
-        logging.info(f"✅ 주문 ID {order_id} 취소 완료")
-
+        client.futures_cancel_all_open_orders(symbol=symbol)
+        logging.info(f"✅ 모든 열린 주문 취소 완료 ({symbol})")
     except Exception as e:
-        if "code=-2011" in str(e):
-            logging.warning(f"⚠️ 주문 ID {order_id}는 이미 사라진 주문입니다.")
-        else:
-            logging.error(f"❌ 주문 취소 실패: {e}")
+        logging.error(f"❌ 전체 주문 취소 실패: {e}")
 
 async def send_telegram_message(message: str):
     await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
@@ -545,10 +531,10 @@ async def trading_loop(backtest=False):
                 await send_telegram_message(f"❌ {label} → 포지션 종료 실패: {e}")
                 return  # 종료 실패 시 다른 동작 금지
         
-            # 예약 TP/SL 주문 취소
+            # 예약 TP/SL 주문 전부 취소
             for order_name, order_id in [('TP', tp_order_id), ('SL', sl_order_id)]:
                 if order_id:
-                    cancel_order(order_id)
+                    cancel_order(symbol=symbol)
 
             # 수익률 기록
             cumulative_pnl += change_pct
@@ -562,7 +548,6 @@ async def trading_loop(backtest=False):
             )
 
             # 상태 초기화
-            
             position_state = None
             entry_price = None
             tp_order_id = None
