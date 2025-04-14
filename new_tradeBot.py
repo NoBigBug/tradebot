@@ -453,7 +453,7 @@ def get_current_position(symbol='BTCUSDT'):
     positions = client.futures_position_information(symbol=symbol)
     for p in positions:
         pos_amt = float(p['positionAmt'])
-        if pos_amt != 0:
+        if abs(pos_amt) > 1e-5:  # 아주 작은 수량 무시
             side = 'long' if pos_amt > 0 else 'short'
             entry_price = float(p['entryPrice'])
             return side, entry_price
@@ -559,8 +559,19 @@ async def trading_loop(backtest=False):
 
     # 중복 진입 방지
     if position_state is not None:
-        logging.info("중복 진입 방지: 이미 포지션이 존재함")
-        return
+         # 실물 포지션 조회
+        actual_pos, actual_entry  = get_current_position()
+
+        # 디버깅 로그 추가
+        logging.info(f"🧪 중복 진입 확인 → 코드상 포지션: {position_state}, Binance: {actual_pos} @ {actual_entry}")
+
+        if actual_pos is None:
+            logging.warning("⚠️ 상태만 남아있고 Binance에는 포지션 없음 → 상태 초기화")
+            position_state = None
+            entry_price = None
+        else:
+            logging.info("중복 진입 방지: 이미 포지션이 존재함")
+            return
 
     # 머신러닝 추세 예측
     trend, confidence = predict_trend_with_proba(df, model_path=trend_model_path)
@@ -622,37 +633,48 @@ async def trading_loop(backtest=False):
     order = place_order(signal, actual_quantity)
     await asyncio.sleep(0.5)  # 체결 대기 (Binance 응답 속도 고려)
 
-    # 실제 체결된 진입 가격 및 방향 확인
-    position_side, real_entry_price = get_current_position()
+    # 포지션 체결 여부 확인 (최대 3회 재조회)
+    retries = 0
+    position_side = None
+    real_entry_price = None
+
+    while retries < 3:
+        position_side, real_entry_price = get_current_position()
+        if position_side:
+            break
+        retries += 1
+        logging.warning(f"📡 포지션 진입 확인 실패 (시도 {retries}) → 1초 후 재시도")
+        await asyncio.sleep(1.0)
+
+  # 체결 실패 시 종료
     if not position_side:
         await send_telegram_message("❌ 포지션 진입 실패 감지 → 트레이딩 스킵")
         return
 
-    # TP/SL 주문 재시도 로직
-    max_retry: int = 3
-    retries = 0    
-    while retries < max_retry:
+    # TP/SL 설정 (최대 3회 재시도)
+    retries = 0
+    while retries < 3:
         try:
             tp_order_id, sl_order_id = place_tp_sl_orders(real_entry_price, signal, actual_quantity)
             logging.info("✅ TP/SL 주문 설정 완료")
-            break  # 성공하면 루프 종료
+            break
         except Exception as e:
             retries += 1
-            logging.error(f"⚠️ TP/SL 주문 실패 (시도 {retries}/{max_retry}): {e}")
-            await asyncio.sleep(1.5)  # 살짝 대기 후 재시도
+            logging.error(f"⚠️ TP/SL 주문 실패 (시도 {retries}/3): {e}")
+            await asyncio.sleep(1.5)
 
-    # TP/SL 재시도 실패 → 포지션 종료 + 경고
-    if retries == max_retry:
+    # TP/SL 설정 실패 시 포지션 강제 종료
+    if retries == 3:
         await send_telegram_message("🚨 TP/SL 주문 실패 → 포지션 강제 종료")
         close_position(signal, actual_quantity)
         return
 
-    # 5. 모든 게 정상이면 상태 저장
+    # 모든 게 정상이면 상태 저장
     position_state = signal
     entry_price = real_entry_price
     just_entered = True
 
-    # ✅ 진입 알림을 이 시점에 바로 보냄 (누락 방지)
+    # 진입 알림을 이 시점에 바로 보냄 (누락 방지)
     tp_price = round(entry_price * (1 + TP_PERCENT / 100), 2) if signal == 'long' else round(entry_price * (1 - TP_PERCENT / 100), 2)
     sl_price = round(entry_price * (1 - SL_PERCENT / 100), 2) if signal == 'long' else round(entry_price * (1 + SL_PERCENT / 100), 2)
 
@@ -662,7 +684,7 @@ async def trading_loop(backtest=False):
         f"⚠️ SL 예약: {sl_price}"
     )
 
-    logging.info("✅ 진입 알림 전송 완료")
+    logging.info(f"✅ 진입 완료: {signal.upper()} @ {entry_price:.2f} | TP: {tp_price}, SL: {sl_price}")
 
 async def start_bot():
     await send_telegram_message(f"⏳ 프로그램 시작.")
