@@ -5,8 +5,8 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report
 
 def train_entry_strategy_from_csv(
-    csv_path='entry_strategy_dataset.csv',
-    model_path='entry_strategy_model.pkl',
+    csv_path='entry_strategy_dataset_5m.csv',
+    interval='5m',
     test_size=0.2,
     random_state=42
 ):
@@ -46,8 +46,17 @@ def train_entry_strategy_from_csv(
     print(classification_report(y_test, y_pred, digits=4))
 
     # 모델 저장
+    model_path = f"entry_strategy_model_{interval}.pkl"
     joblib.dump(model, model_path)
     print(f"\n✅ 모델 저장 완료 → {model_path}")
 
 if __name__ == "__main__":
-    train_entry_strategy_from_csv()
+    intervals = ['5m', '15m', '1h']
+    for interval in intervals:
+        print(f"\n==============================")
+        print(f"🕒 [{interval}] 모델 학습 시작")
+        print(f"==============================\n")
+        train_entry_strategy_from_csv( 
+            csv_path=f"entry_strategy_dataset_{interval}.csv",
+            interval=interval
+        )

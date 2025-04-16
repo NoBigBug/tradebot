@@ -167,7 +167,7 @@ if __name__ == '__main__':
         df['close'] = df['close'].astype(float)
         return df
 
-    timeframes = ['1m', '5m', '15m', '1h']
+    timeframes = ['5m', '15m', '1h']
 
     for tf in timeframes:
         print(f"\n⏳ {tf} 타임프레임 모델 학습 시작...")
