@@ -52,7 +52,7 @@ position_state = None  # 현재 포지션: 'long', 'short', 또는 None
 entry_price = None     # 진입 가격
 tp_order_id = None     # TP 주문 ID
 sl_order_id = None     # SL 주문 ID
-quantity = 0.1        # 거래 수량 (예: 0.05 BTC)
+quantity = 0.05        # 거래 수량 (예: 0.05 BTC)
 
 # 전략 설정 (기본 TP/SL 및 리스크 제한)
 TP_PERCENT = 1.0        # 목표 수익률 (Take Profit)
@@ -512,11 +512,13 @@ async def multi_tf_trading_loop():
     
     support = resistance = None
     just_entered = False
+    just_recovered = False  # 새로 추가
 
     # 복구 로직 (단, just_entered인 경우는 스킵)
     if not just_entered and position_state is None and entry_price is None:
         position_state, entry_price = get_current_position()
         if position_state:
+            just_recovered = True
             await send_telegram_message(f"🔁 기존 포지션 복구: {position_state.upper()} @ {entry_price}")
             tp_exists, sl_exists = check_existing_tp_sl_orders()
             if not tp_exists or not sl_exists:
@@ -536,6 +538,11 @@ async def multi_tf_trading_loop():
 
     # 포지션 종료 조건 (TP/SL)
     if position_state and entry_price:
+        if just_recovered:
+            logging.info("🔄 포지션 복구 직후 → TP/SL 조건 체크 생략")
+            just_recovered = False  # 다음 루프부터는 정상 체크
+            return
+
         current_price = float(client.futures_mark_price(symbol=symbol)['markPrice'])
         change_pct = (current_price - entry_price) / entry_price * 100
         if position_state == 'short':
@@ -579,9 +586,6 @@ async def multi_tf_trading_loop():
     if position_state is not None:
         # 실물 포지션 조회
         actual_pos, actual_entry = get_current_position()
-
-        # 디버깅 로그 추가
-        logging.info(f"🧪 중복 진입 확인 → 코드상 포지션: {position_state}, Binance: {actual_pos} @ {actual_entry}")
 
         if actual_pos is None:
             position_state = None
@@ -808,7 +812,7 @@ async def run_backtest_and_save(intervals: list, csv_path='backtest_summary.csv'
     # 새 백테스트 실행 결과 저장
     new_data = []
     for interval in intervals:
-        pnl = await backtest_bot(interval)
+        pnl = await backtest_bot(interval, False)
         new_data.append({'Interval': interval, 'PnL': pnl})
 
     new_df = pd.DataFrame(new_data)
@@ -862,14 +866,16 @@ def predict_entry_strategy_from_row(row: pd.Series, model_path: str):
 
 summary_results = {}
 
-async def backtest_bot(interval='5m') -> float:
+async def backtest_bot(interval='5m', isLogShow=True) -> float:
     import joblib
     global position_state, entry_price, volatility_blocked, cumulative_pnl
     global TP_PERCENT, SL_PERCENT, last_reset_month, tp_order_id, sl_order_id
 
     limit = get_auto_limit(interval)
     df = get_klines(symbol='BTCUSDT', interval=interval, limit=limit)
-    logging.info(f"\n📊 백테스트 시작: {interval} / 캔들 수: {limit}개\n")
+    
+    if isLogShow:
+        logging.info(f"\n📊 백테스트 시작: {interval} / 캔들 수: {limit}개\n")
 
     trend_model_path = f"trend_model_xgb_{interval}.pkl"
     entry_model_path = f"entry_strategy_model_{interval}.pkl"
@@ -892,10 +898,12 @@ async def backtest_bot(interval='5m') -> float:
         if current_month != last_reset_month:
             last_reset_month = current_month
             cumulative_pnl = 0.0
-            logging.info(f"\n🔄 새 달 시작 → 누적 수익 초기화")
+            if isLogShow:
+                logging.info(f"\n🔄 새 달 시작 → 누적 수익 초기화")
 
         if cumulative_pnl <= STOP_LOSS_LIMIT:
-            logging.info(f"\n🛑 누적 손실 {cumulative_pnl:.2f}%로 자동 종료")
+            if isLogShow:
+                logging.info(f"\n🛑 누적 손실 {cumulative_pnl:.2f}%로 자동 종료")
             break
 
         # 추세 예측 + confidence 체크
@@ -926,10 +934,12 @@ async def backtest_bot(interval='5m') -> float:
 
         # 실전 상충 필터
         if trend == 2 and signal == 'short':
-            logging.info("📈 상승 추세인데 숏 진입 시도 → 회피")
+            if isLogShow:
+                logging.info("📈 상승 추세인데 숏 진입 시도 → 회피")
             continue
         elif trend == 0 and signal == 'long':
-            logging.info("📉 하락 추세인데 롱 진입 시도 → 회피")
+            if isLogShow:
+                logging.info("📉 하락 추세인데 롱 진입 시도 → 회피")
             continue
 
         # 🔽 포지션 종료 조건 (TP / SL / 신호 소멸)
@@ -949,10 +959,11 @@ async def backtest_bot(interval='5m') -> float:
                     "❌ 신호 소멸"
                 )
                 cumulative_pnl += change_pct
-                logging.info(
-                    f"{label} → {position_state.upper()} 종료 | "
-                    f"PnL: {change_pct:.2f}%, 누적: {cumulative_pnl:.2f}%"
-                )
+                if isLogShow:
+                    logging.info(
+                        f"{label} → {position_state.upper()} 종료 | "
+                        f"PnL: {change_pct:.2f}%, 누적: {cumulative_pnl:.2f}%"
+                    )
                 position_state = None
                 entry_price = None
                 continue
@@ -961,16 +972,19 @@ async def backtest_bot(interval='5m') -> float:
         if not volatility_blocked and position_state is None:
             position_state = signal
             entry_price = current_price
-            logging.info(
-                f"\n🧠 {timestamp} | 추세: {trend} / 전략: {'추세' if strategy == 1 else '역추세'} / "
-                f"방향: {signal.upper()} / 신뢰도: {confidence:.2f}"
-            )
-            logging.info(
-                f"🔥 진입 @ {entry_price:.2f} | TP: {TP_PERCENT}%, SL: {SL_PERCENT}%"
-            )
+            if isLogShow:
+                logging.info(
+                    f"\n🧠 {timestamp} | 추세: {trend} / 전략: {'추세' if strategy == 1 else '역추세'} / "
+                    f"방향: {signal.upper()} / 신뢰도: {confidence:.2f}"
+                )
+                logging.info(
+                    f"🔥 진입 @ {entry_price:.2f} | TP: {TP_PERCENT}%, SL: {SL_PERCENT}%"
+                )
             continue
 
-    logging.info(f"\n✅ 백테스트 종료 → 최종 누적 PnL: {cumulative_pnl:.2f}%\n")
+    if isLogShow:
+        logging.info(f"\n✅ 백테스트 종료 → 최종 누적 PnL: {cumulative_pnl:.2f}%\n")
+
     return cumulative_pnl
 
 if __name__ == "__main__":
