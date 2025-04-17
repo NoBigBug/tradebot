@@ -59,7 +59,7 @@ def train_entry_strategy_from_csv(
     print(f"\n✅ 모델 저장 완료 → {model_path}")
 
 if __name__ == "__main__":
-    intervals = ['5m', '15m', '1h']
+    intervals = ['15m', '1h']
     for interval in intervals:
         print(f"\n==============================")
         print(f"🕒 [{interval}] 모델 학습 시작")

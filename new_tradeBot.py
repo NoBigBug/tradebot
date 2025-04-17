@@ -73,7 +73,7 @@ last_reset_month = datetime.now().month
 KST = timezone(timedelta(hours=9))
 
 # 트레이딩 인터벌 설정 ('1m', '5m', '15m', '1h' 등)
-TRADING_INTERVAL = '1m'
+TRADING_INTERVAL = '15m'
 
 # 로깅 레벨 설정
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
@@ -133,8 +133,6 @@ def interval_to_minutes(interval_str):
 # 추세 예측 (trend_model_xgb 사용)
 # 결과: trend (0: 하락, 1: 횡보, 2: 상승), confidence (확률)
 def predict_trend_with_proba(df: pd.DataFrame, model_path=f"trend_model_xgb_{TRADING_INTERVAL}.pkl"):
-    from xgboost import XGBClassifier
-
     df = df.copy()
     df['return'] = df['close'].pct_change()
     df['ma5'] = df['close'].rolling(window=5).mean()
@@ -319,7 +317,7 @@ async def maybe_retrain_entry_strategy():
         now_kst.time() >= target_time and
         (last_entry_str is None or last_entry_str < today_str)
     ):
-        intervals = ['5m', '15m', '1h']
+        intervals = ['15m', '1h']
 
         for interval in intervals:
             try:
@@ -503,7 +501,7 @@ def load_sorted_intervals_from_backtest(filepath='backtest_summary.csv') -> list
         return sorted_df['Interval'].tolist()
     except Exception as e:
         logging.warning(f"📄 백테스트 결과 로딩 실패 → 기본 순서 사용: {e}")
-        return ['15m', '5m', '1h']
+        return ['15m', '1h']
 
 async def multi_tf_trading_loop():
     global position_state, entry_price, volatility_blocked, cumulative_pnl
@@ -515,7 +513,7 @@ async def multi_tf_trading_loop():
     try:
         intervals = load_sorted_intervals_from_backtest()  # 자동 우선순위 반영
     except:
-        intervals = ['15m', '5m', '1h']  # fallback
+        intervals = ['15m', '1h']  # fallback
     
     support = None
     resistance = None
@@ -829,7 +827,7 @@ async def auto_backtest_scheduler():
 
         # 매시 정각 (00, 01, 02...)마다 5m, 15m 백테스트
         if now.minute == 0:
-            await run_backtest_and_save(['5m', '15m'])
+            await run_backtest_and_save(['15m'])
 
         # 매일 00:30에는 1h 백테스트
         if now.hour == 0 and now.minute == 30:
@@ -838,7 +836,7 @@ async def auto_backtest_scheduler():
         await asyncio.sleep(60)  # 1분마다 확인
 
 async def run_all_backtests():
-    intervals = ['5m', '15m', '1h']
+    intervals = ['15m', '1h']
     summary_results = {}
 
     for interval in intervals:
@@ -920,16 +918,6 @@ async def backtest_bot(interval='5m', isLogShow=True) -> float:
         if signal is None:
             continue
 
-        # 실전 상충 필터
-        # if trend == 2 and signal == 'short':
-        #     if isLogShow:
-        #         logging.info("📈 상승 추세인데 숏 진입 시도 → 회피")
-        #     continue
-        # elif trend == 0 and signal == 'long':
-        #     if isLogShow:
-        #         logging.info("📉 하락 추세인데 롱 진입 시도 → 회피")
-        #     continue
-
         # 🔽 포지션 종료 조건 (TP / SL / 신호 소멸)
         if bak_position_state and bak_entry_price:
             change_pct = (current_price - bak_entry_price) / bak_entry_price * 100
@@ -955,6 +943,16 @@ async def backtest_bot(interval='5m', isLogShow=True) -> float:
                 bak_position_state = None
                 bak_entry_price = None
                 continue
+
+        # 실전 상충 필터
+        if trend == 2 and signal == 'short':
+            if isLogShow:
+                logging.info("📈 상승 추세인데 숏 진입 시도 → 회피")
+            continue
+        elif trend == 0 and signal == 'long':
+            if isLogShow:
+                logging.info("📉 하락 추세인데 롱 진입 시도 → 회피")
+            continue
 
         # 🔼 진입 조건 (포지션 없고, 조건 충족)
         if not bak_volatility_blocked and bak_position_state is None:

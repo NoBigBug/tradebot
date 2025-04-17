@@ -1,15 +1,13 @@
 import pandas as pd
-import numpy as np
-from xgboost import XGBClassifier
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report, f1_score
 import joblib
 import os
 import sys
-from datetime import datetime
+import asyncio
 
+from xgboost import XGBClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, f1_score
 from telegram import Bot
-
 from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
@@ -125,30 +123,13 @@ def train_trend_model(df: pd.DataFrame, model_path='trend_model_xgb.pkl'):
             f"📁 기존 모델 유지됨"
         )
     
-    send_telegram_message_sync(message)
+    asyncio.run(send_telegram_message_sync(message))
 
-# 텔레그램 메시지 전송용 (비동기 필요 없음)
 async def send_telegram_message_sync(message: str):
     try:
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
     except Exception as e:
         print(f"❌ 텔레그램 전송 실패: {e}")
-
-def get_auto_limit(interval: str) -> int:
-    if interval == '1m':
-        return 1500
-    elif interval == '5m':
-        return 1000
-    elif interval == '15m':
-        return 1000
-    elif interval == '1h':
-        return 1000
-    elif interval == '4h':
-        return 500
-    elif interval == '1d':
-        return 365
-    else:
-        return 1000  # 기본값
 
 # Binance에서 데이터 받아서 학습 실행
 if __name__ == '__main__':
@@ -167,11 +148,12 @@ if __name__ == '__main__':
         df['close'] = df['close'].astype(float)
         return df
 
-    timeframes = ['5m', '15m', '1h']
+    timeframes = ['15m', '1h']
 
     for tf in timeframes:
-        print(f"\n⏳ {tf} 타임프레임 모델 학습 시작...")
-        limit = get_auto_limit(tf)
-        df = get_klines(interval=tf, limit=limit)
+        print(f"\n==============================")
+        print(f"🕒 [{tf}] 타임프레임 모델 학습 시작")
+        print(f"==============================\n")
+        df = get_klines(interval=tf, limit=1000)
         model_path = f"trend_model_xgb_{tf}.pkl"
         train_trend_model(df, model_path=model_path)
