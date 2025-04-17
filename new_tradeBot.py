@@ -67,7 +67,7 @@ last_reset_month = datetime.now().month
 KST = timezone(timedelta(hours=9))
 
 # 트레이딩 인터벌 설정 ('1m', '5m', '15m', '1h' 등)
-TRADING_INTERVAL = '5m'
+TRADING_INTERVAL = '1m'
 
 # 로깅 레벨 설정
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
@@ -512,13 +512,11 @@ async def multi_tf_trading_loop():
     
     support = resistance = None
     just_entered = False
-    just_recovered = False  # 새로 추가
-
+    
     # 복구 로직 (단, just_entered인 경우는 스킵)
     if not just_entered and position_state is None and entry_price is None:
         position_state, entry_price = get_current_position()
         if position_state:
-            just_recovered = True
             await send_telegram_message(f"🔁 기존 포지션 복구: {position_state.upper()} @ {entry_price}")
             tp_exists, sl_exists = check_existing_tp_sl_orders()
             if not tp_exists or not sl_exists:
@@ -536,52 +534,6 @@ async def multi_tf_trading_loop():
         await send_telegram_message(f"🛑 누적 손실 {cumulative_pnl:.2f}%로 자동 중단됩니다.")
         raise SystemExit
 
-    # 포지션 종료 조건 (TP/SL)
-    if position_state and entry_price:
-        if just_recovered:
-            logging.info("🔄 포지션 복구 직후 → TP/SL 조건 체크 생략")
-            just_recovered = False  # 다음 루프부터는 정상 체크
-            return
-
-        current_price = float(client.futures_mark_price(symbol=symbol)['markPrice'])
-        change_pct = (current_price - entry_price) / entry_price * 100
-        if position_state == 'short':
-            change_pct *= -1
-
-        if change_pct >= TP_PERCENT or change_pct <= -SL_PERCENT:
-            label = "🎯 TP 도달" if change_pct >= TP_PERCENT else "⚠️ SL 도달"
-            
-            try:
-                # 포지션 종료 시도
-                close_position(position_state, quantity)
-            except Exception as e:
-                logging.error(f"❌ 포지션 종료 실패: {e}")
-                await send_telegram_message(f"❌ {label} → 포지션 종료 실패: {e}")
-                return  # 종료 실패 시 다른 동작 금지
-
-            cancel_order(symbol)
-
-            # 수익률 기록
-            cumulative_pnl += change_pct
-
-            # 알림 전송
-            await send_telegram_message(
-                f"{label}. {position_state.upper()} 종료\n"
-                f"PnL: {change_pct:.2f}%\n"
-                f"누적 PnL: {cumulative_pnl:.2f}%\n"
-                f"📉 포지션 종료 완료"
-            )
-
-            # 상태 초기화
-            position_state = None
-            entry_price = None
-            tp_order_id = None
-            sl_order_id = None
-
-            await asyncio.sleep(1.5)
-            logging.info("✅ 포지션 종료 후 상태 초기화 및 대기 완료")
-            return
-
     # 중복 진입 방지
     if position_state is not None:
         # 실물 포지션 조회
@@ -590,6 +542,7 @@ async def multi_tf_trading_loop():
         if actual_pos is None:
             position_state = None
             entry_price = None
+            await send_telegram_message("🔁 기존 포지션 종료")
             logging.warning("⚠️ Binance에는 포지션 없지만 상태 남아 있음 → 초기화")
         else:
             logging.info("중복 진입 방지: 이미 포지션이 존재함")
@@ -658,12 +611,12 @@ async def multi_tf_trading_loop():
             f"📌 진입 방향: {signal.upper()}"
         )
 
-        if trend == 2 and signal == 'short':
-            await send_telegram_message(f"📈 [{interval}] 상승 추세인데 숏 진입 시도 → 회피")
-            continue
-        if trend == 0 and signal == 'long':
-            await send_telegram_message(f"📉 [{interval}] 하락 추세인데 롱 진입 시도 → 회피")
-            continue
+        # if trend == 2 and signal == 'short':
+        #     await send_telegram_message(f"📈 [{interval}] 상승 추세인데 숏 진입 시도 → 회피")
+        #     continue
+        # if trend == 0 and signal == 'long':
+        #     await send_telegram_message(f"📉 [{interval}] 하락 추세인데 롱 진입 시도 → 회피")
+        #     continue
 
         current_price = float(client.futures_mark_price(symbol=symbol)['markPrice'])
 
@@ -893,14 +846,6 @@ async def backtest_bot(interval='5m', isLogShow=True) -> float:
         current_price = sliced_df['close'].iloc[-1]
         timestamp = pd.to_datetime(sliced_df['timestamp'].iloc[-1], unit='ms')
 
-        # 월별 누적 수익 초기화
-        current_month = timestamp.month
-        if current_month != last_reset_month:
-            last_reset_month = current_month
-            cumulative_pnl = 0.0
-            if isLogShow:
-                logging.info(f"\n🔄 새 달 시작 → 누적 수익 초기화")
-
         if cumulative_pnl <= STOP_LOSS_LIMIT:
             if isLogShow:
                 logging.info(f"\n🛑 누적 손실 {cumulative_pnl:.2f}%로 자동 종료")
@@ -933,14 +878,14 @@ async def backtest_bot(interval='5m', isLogShow=True) -> float:
             continue
 
         # 실전 상충 필터
-        if trend == 2 and signal == 'short':
-            if isLogShow:
-                logging.info("📈 상승 추세인데 숏 진입 시도 → 회피")
-            continue
-        elif trend == 0 and signal == 'long':
-            if isLogShow:
-                logging.info("📉 하락 추세인데 롱 진입 시도 → 회피")
-            continue
+        # if trend == 2 and signal == 'short':
+        #     if isLogShow:
+        #         logging.info("📈 상승 추세인데 숏 진입 시도 → 회피")
+        #     continue
+        # elif trend == 0 and signal == 'long':
+        #     if isLogShow:
+        #         logging.info("📉 하락 추세인데 롱 진입 시도 → 회피")
+        #     continue
 
         # 🔽 포지션 종료 조건 (TP / SL / 신호 소멸)
         if position_state and entry_price:
