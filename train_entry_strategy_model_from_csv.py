@@ -23,6 +23,14 @@ def train_entry_strategy_from_csv(
     X = df.drop(columns=['label'])
     y = df['label']
 
+    # 레이블 분포 확인
+    print(f"🎯 레이블 분포:\n{y.value_counts()}\n")
+
+    # 레이블이 하나뿐이면 학습 중단
+    if len(y.unique()) < 2:
+        print("⚠️ 레이블이 하나의 클래스만 포함되어 있어 학습을 건너뜁니다.")
+        return
+
     # 학습/검증 분리
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=test_size, random_state=random_state, stratify=y

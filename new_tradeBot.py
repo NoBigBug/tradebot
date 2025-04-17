@@ -503,6 +503,7 @@ async def multi_tf_trading_loop():
     global position_state, entry_price, volatility_blocked, cumulative_pnl
     global TP_PERCENT, SL_PERCENT, last_reset_month, tp_order_id, sl_order_id
 
+    # 심볼 선택(추후에는 여러 코인으로 확장)
     symbol = 'BTCUSDT'
     
     try:
@@ -510,18 +511,8 @@ async def multi_tf_trading_loop():
     except:
         intervals = ['15m', '5m', '1h']  # fallback
     
-    support = resistance = None
-    just_entered = False
-    
-    # 복구 로직 (단, just_entered인 경우는 스킵)
-    if not just_entered and position_state is None and entry_price is None:
-        position_state, entry_price = get_current_position()
-        if position_state:
-            await send_telegram_message(f"🔁 기존 포지션 복구: {position_state.upper()} @ {entry_price}")
-            tp_exists, sl_exists = check_existing_tp_sl_orders()
-            if not tp_exists or not sl_exists:
-                tp_order_id, sl_order_id = place_tp_sl_orders(entry_price, position_state, quantity)
-                await send_telegram_message("🛠️ 누락된 TP/SL 주문을 재설정했습니다.")
+    support = None
+    resistance = None
 
     # 월별 초기화 / 손실 중단
     current_month = datetime.now().month
@@ -529,6 +520,53 @@ async def multi_tf_trading_loop():
         last_reset_month = current_month
         cumulative_pnl = 0.0
         await send_telegram_message("🔄 새 달이 시작되어 누적 수익률을 초기화합니다.")
+
+    # 복구 로직(보통 재시작됬을때 정보가져오기용)
+    if position_state is None and entry_price is None:
+        position_state, entry_price = get_current_position()
+        
+        # 기존 포지션이 복구된것은 굳이 밑에 로직을 진행할 필요가 없기떄문에 return
+        if position_state:
+            await send_telegram_message(f"🔁 기존 포지션 복구: {position_state.upper()} @ {entry_price}")
+            tp_exists, sl_exists = check_existing_tp_sl_orders()
+            if not tp_exists or not sl_exists:
+                tp_order_id, sl_order_id = place_tp_sl_orders(entry_price, position_state, quantity)
+                await send_telegram_message("🛠️ 누락된 TP/SL 주문을 재설정했습니다.")
+
+            return
+        
+    # 포지션 종료 체크
+    if position_state and entry_price:
+        current_price = float(client.futures_mark_price(symbol=symbol)['markPrice'])
+        change_pct = (current_price - entry_price) / entry_price * 100
+        if position_state == 'short':
+            change_pct *= -1
+
+        if change_pct >= TP_PERCENT or change_pct <= -SL_PERCENT:
+            label = "🎯 TP 도달" if change_pct >= TP_PERCENT else "⚠️ SL 도달"
+            
+            # 남아있는 tp, sl 주문 제거
+            cancel_order(symbol)
+
+            # 수익률 기록
+            cumulative_pnl += change_pct
+
+            # 알림 전송
+            await send_telegram_message(
+                f"{label}. {position_state.upper()} 종료\n"
+                f"PnL: {change_pct:.2f}%\n"
+                f"누적 PnL: {cumulative_pnl:.2f}%\n"
+                f"📉 포지션 종료 완료"
+            )
+
+            # 상태 초기화
+            position_state = None
+            entry_price = None
+            tp_order_id = None
+            sl_order_id = None
+
+            await asyncio.sleep(1.5)
+            logging.info("✅ 포지션 종료 후 상태 초기화 및 대기 완료")
 
     if cumulative_pnl <= STOP_LOSS_LIMIT:
         await send_telegram_message(f"🛑 누적 손실 {cumulative_pnl:.2f}%로 자동 중단됩니다.")
@@ -542,7 +580,6 @@ async def multi_tf_trading_loop():
         if actual_pos is None:
             position_state = None
             entry_price = None
-            await send_telegram_message("🔁 기존 포지션 종료")
             logging.warning("⚠️ Binance에는 포지션 없지만 상태 남아 있음 → 초기화")
         else:
             logging.info("중복 진입 방지: 이미 포지션이 존재함")
@@ -626,7 +663,7 @@ async def multi_tf_trading_loop():
         except Exception as e:
             await send_telegram_message(f"❌ 주문 실패: {e}")
             return
-        await asyncio.sleep(0.5)  # 체결 대기 (Binance 응답 속도 고려)
+        await asyncio.sleep(1.5)  # 체결 대기 (Binance 응답 속도 고려)
 
         # 포지션 체결 여부 확인 (최대 3회 재조회)
         retries = 0
@@ -667,8 +704,7 @@ async def multi_tf_trading_loop():
         # 모든 게 정상이면 상태 저장
         position_state = signal
         entry_price = real_entry_price
-        just_entered = True
-
+        
         tp_price = round(entry_price * (1 + TP_PERCENT / 100), 2) if signal == 'long' else round(entry_price * (1 - TP_PERCENT / 100), 2)
         sl_price = round(entry_price * (1 - SL_PERCENT / 100), 2) if signal == 'long' else round(entry_price * (1 + SL_PERCENT / 100), 2)
 
