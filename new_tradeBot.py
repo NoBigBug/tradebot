@@ -49,17 +49,23 @@ bot = Bot(token=TELEGRAM_BOT_TOKEN, request=HTTPXRequest(connect_timeout=10.0, r
 
 # 포지션 및 거래 상태 전역 변수
 position_state = None  # 현재 포지션: 'long', 'short', 또는 None
+bak_position_state = None
 entry_price = None     # 진입 가격
+bak_entry_price = None
 tp_order_id = None     # TP 주문 ID
 sl_order_id = None     # SL 주문 ID
 quantity = 0.05        # 거래 수량 (예: 0.05 BTC)
 
 # 전략 설정 (기본 TP/SL 및 리스크 제한)
 TP_PERCENT = 1.0        # 목표 수익률 (Take Profit)
+BAK_TP_PERCENT = 1.0 
 SL_PERCENT = 0.5        # 손절 기준 (Stop Loss)
+BAK_SL_PERCENT = 0.5 
 VOLATILITY_THRESHOLD = 2.5  # 변동성 기준 (%)
 volatility_blocked = False  # 변동성 초과 시 거래 금지
+bak_volatility_blocked = False
 cumulative_pnl = 0.0        # 누적 수익률
+bak_cumulative_pnl = 0.0
 STOP_LOSS_LIMIT = -10.0     # 누적 손실 한계 (이하일 경우 중단)
 last_reset_month = datetime.now().month
 
@@ -605,14 +611,22 @@ async def multi_tf_trading_loop():
             volatility_blocked = False
 
         trend, confidence = predict_trend_with_proba(df, model_path=trend_model_path)
-        if trend == 1:
-            logging.info(f"😐 [{interval}] 횡보 예측 → 진입 회피")
-            continue
-        
         if confidence < 0.6:
             logging.info(f"❌ [{interval}] 신뢰도 낮음({confidence * 100:.2f}%) → 진입 회피")
             continue
+        
+        # if trend == 1:
+        #     logging.info(f"😐 [{interval}] 횡보 예측 → 진입 회피")
+        #     continue
 
+        # if trend == 2 and signal == 'short':
+        #     await send_telegram_message(f"📈 [{interval}] 상승 추세인데 숏 진입 시도 → 회피")
+        #     continue
+        
+        # if trend == 0 and signal == 'long':
+        #     await send_telegram_message(f"📉 [{interval}] 하락 추세인데 롱 진입 시도 → 회피")
+        #     continue
+        
         # entry 전략 예측을 위한 feature 생성
         entry_features_df = generate_entry_strategy_dataset(df, trend_model_path=trend_model_path)
         if entry_features_df.empty:
@@ -647,13 +661,6 @@ async def multi_tf_trading_loop():
             f"지지선: {support} / 저항선: {resistance}\n"
             f"📌 진입 방향: {signal.upper()}"
         )
-
-        # if trend == 2 and signal == 'short':
-        #     await send_telegram_message(f"📈 [{interval}] 상승 추세인데 숏 진입 시도 → 회피")
-        #     continue
-        # if trend == 0 and signal == 'long':
-        #     await send_telegram_message(f"📉 [{interval}] 하락 추세인데 롱 진입 시도 → 회피")
-        #     continue
 
         current_price = float(client.futures_mark_price(symbol=symbol)['markPrice'])
 
@@ -857,8 +864,8 @@ summary_results = {}
 
 async def backtest_bot(interval='5m', isLogShow=True) -> float:
     import joblib
-    global position_state, entry_price, volatility_blocked, cumulative_pnl
-    global TP_PERCENT, SL_PERCENT, last_reset_month, tp_order_id, sl_order_id
+    global bak_position_state, bak_entry_price, bak_volatility_blocked, bak_cumulative_pnl
+    global BAK_TP_PERCENT, BAK_SL_PERCENT
 
     limit = get_auto_limit(interval)
     df = get_klines(symbol='BTCUSDT', interval=interval, limit=limit)
@@ -882,9 +889,9 @@ async def backtest_bot(interval='5m', isLogShow=True) -> float:
         current_price = sliced_df['close'].iloc[-1]
         timestamp = pd.to_datetime(sliced_df['timestamp'].iloc[-1], unit='ms')
 
-        if cumulative_pnl <= STOP_LOSS_LIMIT:
+        if bak_cumulative_pnl <= STOP_LOSS_LIMIT:
             if isLogShow:
-                logging.info(f"\n🛑 누적 손실 {cumulative_pnl:.2f}%로 자동 종료")
+                logging.info(f"\n🛑 누적 손실 {bak_cumulative_pnl:.2f}%로 자동 종료")
             break
 
         # 추세 예측 + confidence 체크
@@ -924,9 +931,9 @@ async def backtest_bot(interval='5m', isLogShow=True) -> float:
         #     continue
 
         # 🔽 포지션 종료 조건 (TP / SL / 신호 소멸)
-        if position_state and entry_price:
-            change_pct = (current_price - entry_price) / entry_price * 100
-            if position_state == 'short':
+        if bak_position_state and bak_entry_price:
+            change_pct = (current_price - bak_entry_price) / bak_entry_price * 100
+            if bak_position_state == 'short':
                 change_pct *= -1
 
             hit_tp = change_pct >= TP_PERCENT
@@ -939,34 +946,34 @@ async def backtest_bot(interval='5m', isLogShow=True) -> float:
                     "⚠️ SL" if hit_sl else
                     "❌ 신호 소멸"
                 )
-                cumulative_pnl += change_pct
+                bak_cumulative_pnl += change_pct
                 if isLogShow:
                     logging.info(
-                        f"{label} → {position_state.upper()} 종료 | "
-                        f"PnL: {change_pct:.2f}%, 누적: {cumulative_pnl:.2f}%"
+                        f"{label} → {bak_position_state.upper()} 종료 | "
+                        f"PnL: {change_pct:.2f}%, 누적: {bak_cumulative_pnl:.2f}%"
                     )
-                position_state = None
-                entry_price = None
+                bak_position_state = None
+                bak_entry_price = None
                 continue
 
         # 🔼 진입 조건 (포지션 없고, 조건 충족)
-        if not volatility_blocked and position_state is None:
-            position_state = signal
-            entry_price = current_price
+        if not bak_volatility_blocked and bak_position_state is None:
+            bak_position_state = signal
+            bak_entry_price = current_price
             if isLogShow:
                 logging.info(
                     f"\n🧠 {timestamp} | 추세: {trend} / 전략: {'추세' if strategy == 1 else '역추세'} / "
                     f"방향: {signal.upper()} / 신뢰도: {confidence:.2f}"
                 )
                 logging.info(
-                    f"🔥 진입 @ {entry_price:.2f} | TP: {TP_PERCENT}%, SL: {SL_PERCENT}%"
+                    f"🔥 진입 @ {bak_entry_price:.2f} | TP: {BAK_TP_PERCENT}%, SL: {BAK_SL_PERCENT}%"
                 )
             continue
 
     if isLogShow:
-        logging.info(f"\n✅ 백테스트 종료 → 최종 누적 PnL: {cumulative_pnl:.2f}%\n")
+        logging.info(f"\n✅ 백테스트 종료 → 최종 누적 PnL: {bak_cumulative_pnl:.2f}%\n")
 
-    return cumulative_pnl
+    return bak_cumulative_pnl
 
 if __name__ == "__main__":
     mode = input("실행 모드 선택 (live / backtest / all_backtest): ").strip()
