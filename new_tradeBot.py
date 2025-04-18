@@ -191,8 +191,6 @@ def predict_trend_with_proba(df: pd.DataFrame, model_path=f"trend_model_xgb_{TRA
 # 진입 전략 학습용 데이터셋 생성
 # 출력: features + label (0: 역추세, 1: 추세)
 def generate_entry_strategy_dataset(df: pd.DataFrame, trend_model_path: str, future_window: int = 10):
-    from xgboost import XGBClassifier
-
     data = []
     df = df.copy()
 
@@ -613,17 +611,9 @@ async def multi_tf_trading_loop():
             logging.info(f"❌ [{interval}] 신뢰도 낮음({confidence * 100:.2f}%) → 진입 회피")
             continue
         
-        # if trend == 1:
-        #     logging.info(f"😐 [{interval}] 횡보 예측 → 진입 회피")
-        #     continue
-
-        # if trend == 2 and signal == 'short':
-        #     await send_telegram_message(f"📈 [{interval}] 상승 추세인데 숏 진입 시도 → 회피")
-        #     continue
-        
-        # if trend == 0 and signal == 'long':
-        #     await send_telegram_message(f"📉 [{interval}] 하락 추세인데 롱 진입 시도 → 회피")
-        #     continue
+        if trend == 1:
+            logging.info(f"😐 [{interval}] 횡보 예측 → 진입 회피")
+            continue
         
         # entry 전략 예측을 위한 feature 생성
         entry_features_df = generate_entry_strategy_dataset(df, trend_model_path=trend_model_path)
@@ -641,6 +631,14 @@ async def multi_tf_trading_loop():
         signal = trend_to_signal(trend) if strategy == 1 else reverse_signal(trend_to_signal(trend))
         if signal is None:
             logging.info(f"🚫 [{interval}] 진입 신호 없음 (None)")
+            continue
+
+        if trend == 2 and signal == 'short':
+            await send_telegram_message(f"📈 [{interval}] 상승 추세인데 숏 진입 시도 → 회피")
+            continue
+        
+        if trend == 0 and signal == 'long':
+            await send_telegram_message(f"📉 [{interval}] 하락 추세인데 롱 진입 시도 → 회피")
             continue
 
         # confidence 기반 TP/SL 조정
@@ -865,15 +863,12 @@ async def backtest_bot(interval='5m', isLogShow=True) -> float:
     global bak_position_state, bak_entry_price, bak_volatility_blocked, bak_cumulative_pnl
     global BAK_TP_PERCENT, BAK_SL_PERCENT
 
-    limit = get_auto_limit(interval)
-    df = get_klines(symbol='BTCUSDT', interval=interval, limit=limit)
-    
+    df = get_klines(symbol='BTCUSDT', interval=interval, limit=1000)
     if isLogShow:
-        logging.info(f"\n📊 백테스트 시작: {interval} / 캔들 수: {limit}개\n")
+        logging.info(f"\n📊 백테스트 시작: {interval} / 캔들 수: 1000개\n")
 
     trend_model_path = f"trend_model_xgb_{interval}.pkl"
     entry_model_path = f"entry_strategy_model_{interval}.pkl"
-    trend_model = joblib.load(trend_model_path)
     entry_model = joblib.load(entry_model_path)
 
     def trend_to_signal(trend: int):
@@ -894,16 +889,6 @@ async def backtest_bot(interval='5m', isLogShow=True) -> float:
 
         # 추세 예측 + confidence 체크
         trend, confidence = predict_trend_sync(sliced_df, model_path=trend_model_path)
-        if trend == 1 or confidence < 0.6:
-            continue
-
-        # TP/SL 조정
-        if confidence >= 0.8:
-            TP_PERCENT, SL_PERCENT = 1.8, 0.3
-        elif confidence >= 0.6:
-            TP_PERCENT, SL_PERCENT = 1.0, 0.5
-        else:
-            TP_PERCENT, SL_PERCENT = 0.7, 0.5
 
         # 진입 전략 feature 생성
         entry_features_df = generate_entry_strategy_dataset(sliced_df, trend_model_path=trend_model_path)
@@ -917,6 +902,27 @@ async def backtest_bot(interval='5m', isLogShow=True) -> float:
         signal = trend_to_signal(trend) if strategy == 1 else reverse_signal(trend_to_signal(trend))
         if signal is None:
             continue
+        
+        if trend == 1 or confidence < 0.6:
+            continue
+
+        # 실전 상충 필터
+        if trend == 2 and signal == 'short':
+            if isLogShow:
+                logging.info("📈 상승 추세인데 숏 진입 시도 → 회피")
+            continue
+        elif trend == 0 and signal == 'long':
+            if isLogShow:
+                logging.info("📉 하락 추세인데 롱 진입 시도 → 회피")
+            continue
+
+        # TP/SL 조정
+        if confidence >= 0.8:
+            TP_PERCENT, SL_PERCENT = 1.8, 0.3
+        elif confidence >= 0.6:
+            TP_PERCENT, SL_PERCENT = 1.0, 0.5
+        else:
+            TP_PERCENT, SL_PERCENT = 0.7, 0.5
 
         # 🔽 포지션 종료 조건 (TP / SL / 신호 소멸)
         if bak_position_state and bak_entry_price:
@@ -943,16 +949,6 @@ async def backtest_bot(interval='5m', isLogShow=True) -> float:
                 bak_position_state = None
                 bak_entry_price = None
                 continue
-
-        # 실전 상충 필터
-        if trend == 2 and signal == 'short':
-            if isLogShow:
-                logging.info("📈 상승 추세인데 숏 진입 시도 → 회피")
-            continue
-        elif trend == 0 and signal == 'long':
-            if isLogShow:
-                logging.info("📉 하락 추세인데 롱 진입 시도 → 회피")
-            continue
 
         # 🔼 진입 조건 (포지션 없고, 조건 충족)
         if not bak_volatility_blocked and bak_position_state is None:
