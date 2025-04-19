@@ -7,10 +7,6 @@ import asyncio
 from xgboost import XGBClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, f1_score
-from telegram import Bot
-from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
-
-bot = Bot(token=TELEGRAM_BOT_TOKEN)
 
 sys.stdout.reconfigure(encoding='utf-8')
 
@@ -106,7 +102,7 @@ def train_trend_model(df: pd.DataFrame, model_path='trend_model_xgb.pkl'):
     if new_f1 >= old_f1:
         joblib.dump(new_model, model_path)
         print(f"✅ 새 모델이 더 우수하여 교체 완료 → 저장됨: {model_path}")
-        message = (
+        print(
             "📈 [모델 업데이트 완료]\n\n"
             "🆕 새로운 모델이 기존보다 성능이 더 우수하여 교체되었습니다.\n\n"
             f"🔹 기존 F1 (macro): {old_f1:.4f}\n"
@@ -115,21 +111,13 @@ def train_trend_model(df: pd.DataFrame, model_path='trend_model_xgb.pkl'):
         )
     else:
         print("❌ 새 모델의 성능이 낮아 교체하지 않음")
-        message = (
+        print(
             "📉 [모델 업데이트 스킵]\n\n"
             "❌ 새 모델의 성능이 기존보다 낮아 저장하지 않았습니다.\n\n"
             f"🔹 기존 F1 (macro): {old_f1:.4f}\n"
             f"🔹 새 모델 F1 (macro): {new_f1:.4f}\n"
             f"📁 기존 모델 유지됨"
         )
-    
-    asyncio.run(send_telegram_message_sync(message))
-
-async def send_telegram_message_sync(message: str):
-    try:
-        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
-    except Exception as e:
-        print(f"❌ 텔레그램 전송 실패: {e}")
 
 # Binance에서 데이터 받아서 학습 실행
 if __name__ == '__main__':
