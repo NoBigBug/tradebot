@@ -860,8 +860,10 @@ summary_results = {}
 
 async def backtest_bot(interval='5m', isLogShow=True) -> float:
     import joblib
-    global bak_position_state, bak_entry_price, bak_volatility_blocked, bak_cumulative_pnl
+    global bak_position_state, bak_entry_price, bak_volatility_blocked
     global BAK_TP_PERCENT, BAK_SL_PERCENT
+
+    bak_cumulative_pnl = 0.0
 
     df = get_klines(symbol='BTCUSDT', interval=interval, limit=1000)
     if isLogShow:
