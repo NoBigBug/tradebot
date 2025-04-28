@@ -1,32 +1,43 @@
 import pandas as pd
 import joblib
-from xgboost import XGBClassifier
-from sklearn.model_selection import train_test_split
+from xgboost import XGBClassifier, plot_importance
+from sklearn.model_selection import train_test_split, cross_val_score
 from sklearn.metrics import classification_report
+from sklearn.utils.class_weight import compute_sample_weight
+from config import TRADING_INTERVAL
 
 def train_entry_strategy_from_csv(
-    csv_path='entry_strategy_dataset_5m.csv',
-    interval='5m',
+    csv_path=f'entry_strategy_dataset_{TRADING_INTERVAL}.csv',
+    interval=TRADING_INTERVAL,
     test_size=0.2,
     random_state=42
 ):
-    print(f"📂 CSV 로딩 중: {csv_path}")
+    print(f"CSV 로딩 중: {csv_path}")
     df = pd.read_csv(csv_path)
 
     if df.empty:
-        print("❌ CSV 파일에 데이터가 없습니다.")
+        print("CSV 파일에 데이터가 없습니다.")
         return
 
-    print(f"📊 총 샘플 수: {len(df)}")
+    print(f"총 샘플 수: {len(df)}")
 
-    # 입력 feature와 label 분리
+    # 라벨 확인
+    if 'label' not in df.columns:
+        print("'label' 컬럼이 존재하지 않습니다.")
+        return
+
+    # 레이블 분포 체크
+    label_counts = df['label'].value_counts()
+    if label_counts.min() < 2:
+        print(f"레이블 불균형 (0: {label_counts.get(0,0)}개, 1: {label_counts.get(1,0)}개) → 학습 스킵")
+        return
+
     X = df.drop(columns=['label'])
     y = df['label']
 
     # 레이블 분포 확인
-    print(f"🎯 레이블 분포:\n{y.value_counts()}\n")
+    print(f"레이블 분포:\n{y.value_counts()}\n")
 
-    # 레이블이 하나뿐이면 학습 중단
     if len(y.unique()) < 2:
         print("⚠️ 레이블이 하나의 클래스만 포함되어 있어 학습을 건너뜁니다.")
         return
@@ -36,35 +47,44 @@ def train_entry_strategy_from_csv(
         X, y, test_size=test_size, random_state=random_state, stratify=y
     )
 
-    print(f"🧠 학습 데이터: {len(X_train)}개 | 테스트 데이터: {len(X_test)}개")
+    print(f"학습 데이터: {len(X_train)}개 | 테스트 데이터: {len(X_test)}개")
 
+    # 불균형 데이터 대응용 샘플 가중치 계산
+    sample_weight = compute_sample_weight(class_weight='balanced', y=y_train)
+
+    # 모델 정의
     model = XGBClassifier(
-        n_estimators=100,
-        max_depth=4,
-        learning_rate=0.1,
-        use_label_encoder=False,
+        n_estimators=300,
+        max_depth=5,
+        learning_rate=0.03,
+        subsample=0.8,
+        colsample_bytree=0.8,
         eval_metric='logloss',
         random_state=random_state
     )
-    model.fit(X_train, y_train)
 
-    # 검증 결과 출력
+    # 학습
+    model.fit(X_train, y_train, sample_weight=sample_weight)
+
+    # 검증 예측 및 리포트
     y_pred = model.predict(X_test)
-    print("\n📈 검증 결과:")
+    print("\n 검증 결과:")
     print(classification_report(y_test, y_pred, digits=4))
+
+    # 교차검증
+    scores = cross_val_score(model, X, y, cv=5, scoring='accuracy')
+    print(f"\n 교차검증 평균 정확도: {scores.mean():.4f} / 표준편차: {scores.std():.4f}")
 
     # 모델 저장
     model_path = f"entry_strategy_model_{interval}.pkl"
     joblib.dump(model, model_path)
-    print(f"\n✅ 모델 저장 완료 → {model_path}")
+    print(f"\n 모델 저장 완료 → {model_path}")
 
 if __name__ == "__main__":
     intervals = ['15m', '1h']
+
     for interval in intervals:
         print(f"\n==============================")
-        print(f"🕒 [{interval}] 모델 학습 시작")
+        print(f"[{interval}] 진입 전략 모델 학습 시작")
         print(f"==============================\n")
-        train_entry_strategy_from_csv( 
-            csv_path=f"entry_strategy_dataset_{interval}.csv",
-            interval=interval
-        )
+        train_entry_strategy_from_csv(csv_path=f'entry_strategy_dataset_{interval}.csv', interval=interval)

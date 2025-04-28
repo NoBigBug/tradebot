@@ -1,26 +1,15 @@
 import pandas as pd
 import joblib
-import os
-import sys
-import asyncio
-
-from xgboost import XGBClassifier
+import xgboost as xgb
+from ta.trend import ADXIndicator
+from ta.volatility import AverageTrueRange
+from ta.momentum import StochasticOscillator
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report, f1_score
+from sklearn.metrics import classification_report
+from config import TRADING_INTERVAL # 사용 중인 인터벌(예: '15m') 불러오기
 
-sys.stdout.reconfigure(encoding='utf-8')
-
-def compute_rsi(series: pd.Series, period: int = 14):
-    delta = series.diff()
-    gain = delta.where(delta > 0, 0.0)
-    loss = -delta.where(delta < 0, 0.0)
-    avg_gain = gain.rolling(window=period).mean()
-    avg_loss = loss.rolling(window=period).mean()
-    rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
-
-def extract_features(df: pd.DataFrame) -> pd.DataFrame:
+# 기술 지표 기반 피처 생성
+def compute_features(df: pd.DataFrame):
     df = df.copy()
     df['return'] = df['close'].pct_change()
     df['ma5'] = df['close'].rolling(window=5).mean()
@@ -29,7 +18,7 @@ def extract_features(df: pd.DataFrame) -> pd.DataFrame:
     df['volatility'] = df['return'].rolling(window=5).std()
     df['rsi'] = compute_rsi(df['close'], 14)
 
-    # MACD
+    # MACD 및 시그널
     ema12 = df['close'].ewm(span=12).mean()
     ema26 = df['close'].ewm(span=26).mean()
     df['macd'] = ema12 - ema26
@@ -40,108 +29,145 @@ def extract_features(df: pd.DataFrame) -> pd.DataFrame:
     std20 = df['close'].rolling(window=20).std()
     df['bb_width'] = (2 * std20) / ma20
 
-    df = df.dropna()
-    return df
+    # EMA 간격 비율
+    df['ema9'] = df['close'].ewm(span=9).mean()
+    df['ema21'] = df['close'].ewm(span=21).mean()
+    df['ema_ratio_9_21'] = df['ema9'] / df['ema21']
 
-def label_trend(df: pd.DataFrame, forward_window: int = 5, threshold: float = 0.002) -> pd.DataFrame:
-    future_price = df['close'].shift(-forward_window)
-    df['future_return'] = (future_price - df['close']) / df['close']
+    # ADX (추세 강도 지표)
+    adx = ADXIndicator(high=df['high'], low=df['low'], close=df['close'], window=14)
+    df['adx'] = adx.adx()
 
-    def categorize_trend(r):
-        if r > threshold:
-            return 2   # 상승
-        elif r < -threshold:
-            return 0   # 하락
-        else:
-            return 1   # 횡보
+    # ATR (평균 진폭 범위, 변동성 지표)
+    atr = AverageTrueRange(high=df['high'], low=df['low'], close=df['close'], window=14)
+    df['atr'] = atr.average_true_range()
 
-    df['label'] = df['future_return'].apply(categorize_trend)
-    df = df.dropna()
-    return df
+    # Stochastic RSI (%K)
+    stoch = StochasticOscillator(close=df['close'], high=df['high'], low=df['low'], window=14, smooth_window=3)
+    df['stoch_k'] = stoch.stoch()
 
-def train_trend_model(df: pd.DataFrame, model_path='trend_model_xgb.pkl'):
-    print("🚀 모델 학습 시작...")
-    df = extract_features(df)
-    df = label_trend(df)
+    return df.dropna()
 
-    features = ['ma_ratio', 'volatility', 'rsi', 'macd', 'macd_signal', 'bb_width']
-    X = df[features]
-    y = df['label']
+# RSI 계산 함수
+def compute_rsi(series: pd.Series, period: int = 14):
+    delta = series.diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+    avg_gain = gain.rolling(window=period).mean()
+    avg_loss = loss.rolling(window=period).mean()
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
 
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, stratify=y, random_state=42)
+# 추세 라벨링 함수
+def label_trend(df: pd.DataFrame, future_window=10, threshold=0.8):
+    df = df.copy()
 
-    new_model = XGBClassifier(
-        n_estimators=200,
-        learning_rate=0.03,
-        max_depth=3,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        random_state=42,
-        eval_metric='mlogloss'
+    # 미래 수익률 계산 (10봉 후 기준)
+    df['future_return'] = df['close'].pct_change(periods=future_window).shift(-future_window)
+
+    # 라벨 부여 (상승: 2 / 횡보: 1 / 하락: 0)
+    df['trend'] = df['future_return'].apply(
+        lambda x: 2 if x > threshold / 100 else (0 if x < -threshold / 100 else 1)
     )
-    new_model.fit(X_train, y_train)
-    new_pred = new_model.predict(X_test)
+    return df.dropna()
 
-    new_f1 = f1_score(y_test, new_pred, average='macro')
-    print(f"📈 새 모델 F1-score (macro): {new_f1:.4f}")
-    print("📊 새 모델 분류 리포트:")
-    print(classification_report(y_test, new_pred))
+# 스마트 횡보 판별 기반 트렌드 라벨링
+def label_trend_smart(df: pd.DataFrame, future_window=10, threshold=0.8) -> pd.DataFrame:
+    df = df.copy()
 
-    try:
-        if os.path.exists(model_path):
-            old_model = joblib.load(model_path)
-            old_pred = old_model.predict(X_test)
-            old_f1 = f1_score(y_test, old_pred, average='macro')
-            print(f"📉 기존 모델 F1-score (macro): {old_f1:.4f}")
-        else:
-            raise FileNotFoundError
-    except Exception as e:
-        print(f"⚠️ 기존 모델 로딩 실패 또는 없음 → 새 모델 사용\n{e}")
-        old_f1 = 0.0
+    # 미래 수익률 계산
+    df['future_return'] = df['close'].pct_change(periods=future_window).shift(-future_window)
 
-    if new_f1 >= old_f1:
-        joblib.dump(new_model, model_path)
-        print(f"✅ 새 모델이 더 우수하여 교체 완료 → 저장됨: {model_path}")
-        print(
-            "📈 [모델 업데이트 완료]\n\n"
-            "🆕 새로운 모델이 기존보다 성능이 더 우수하여 교체되었습니다.\n\n"
-            f"🔹 기존 F1 (macro): {old_f1:.4f}\n"
-            f"🔹 새 모델 F1 (macro): {new_f1:.4f}\n"
-            f"📁 {model_path}로 저장 완료"
-        )
-    else:
-        print("❌ 새 모델의 성능이 낮아 교체하지 않음")
-        print(
-            "📉 [모델 업데이트 스킵]\n\n"
-            "❌ 새 모델의 성능이 기존보다 낮아 저장하지 않았습니다.\n\n"
-            f"🔹 기존 F1 (macro): {old_f1:.4f}\n"
-            f"🔹 새 모델 F1 (macro): {new_f1:.4f}\n"
-            f"📁 기존 모델 유지됨"
-        )
+    # 기본 상승/하락/횡보 구분
+    df['basic_trend'] = df['future_return'].apply(
+        lambda x: 2 if x > threshold / 100 else (0 if x < -threshold / 100 else 1)
+    )
+
+    # 추가적인 스마트 횡보 판별
+    # 볼린저 밴드 폭
+    df['ma20'] = df['close'].rolling(window=20).mean()
+    df['std20'] = df['close'].rolling(window=20).std()
+    df['bb_width'] = (2 * df['std20']) / df['ma20']
+
+    # 단기/장기 이평 간 거리
+    df['ema9'] = df['close'].ewm(span=9).mean()
+    df['ema21'] = df['close'].ewm(span=21).mean()
+    df['ema_distance'] = abs(df['ema9'] - df['ema21']) / df['close']
+
+    # ADX 추세 강도
+    adx_indicator = ADXIndicator(high=df['high'], low=df['low'], close=df['close'], window=14)
+    df['adx'] = adx_indicator.adx()
+
+    # 스마트 횡보 조건
+    volatility_condition = df['bb_width'] < 0.01    # 볼린저 밴드 폭 1% 이내
+    ema_condition = df['ema_distance'] < 0.003       # 이평선 간 거리 0.3% 이내
+    adx_condition = df['adx'] < 20                   # ADX 20 이하 (추세 약함)
+
+    smart_consolidation = volatility_condition & ema_condition & adx_condition
+
+    # 최종 트렌드 결정
+    df['trend'] = df.apply(
+        lambda row: 1 if (row['basic_trend'] == 1 or smart_consolidation.loc[row.name]) else row['basic_trend'],
+        axis=1
+    )
+
+    return df.dropna()
+
+# 모델 학습 함수
+def train_model(interval='15m'):
+    # 학습용 CSV 파일 로드
+    df = pd.read_csv(f"trend_training_data_{interval}.csv")
+
+    # 피처 및 라벨 생성
+    df = compute_features(df)
+    df = label_trend_smart(df)
+
+    # 사용 피처 정의
+    features = [
+        'ma_ratio', 'volatility', 'rsi', 'macd', 'macd_signal', 'bb_width',
+        'ema_ratio_9_21', 'adx', 'atr', 'stoch_k'
+    ]
+
+    X = df[features]
+    y = df['trend']  # 0=하락, 1=횡보, 2=상승
+
+    # 학습/검증 데이터 분리
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
+
+    # 다중 클래스 XGBoost 모델 정의
+    model = xgb.XGBClassifier(
+        n_estimators=300,
+        max_depth=5,
+        learning_rate=0.03,
+        subsample=0.9,
+        colsample_bytree=0.9,
+        use_label_encoder=False,
+        eval_metric='mlogloss',
+        random_state=42,
+        verbosity=0,
+        objective='multi:softprob',  # 다중 클래스 확률 출력
+        num_class=3,
+        tree_method='hist',
+        scale_pos_weight=1,
+    )
+
+    # 모델 학습
+    model.fit(X_train, y_train)
+
+    # 평가 결과 출력
+    y_pred = model.predict(X_test)
+    print("\n[모델 평가 결과]")
+    print(classification_report(y_test, y_pred, digits=3))
+
+    # 모델 저장
+    joblib.dump(model, f"trend_model_xgb_{interval}.pkl")
+    print(f"\n모델 저장 완료 → trend_model_xgb_{interval}.pkl")
 
 # Binance에서 데이터 받아서 학습 실행
 if __name__ == '__main__':
-    from binance.client import Client
-    from config import BINANCE_API_KEY, BINANCE_API_SECRET
+    intervals = ['15m', '1h']
 
-    client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
-
-    def get_klines(symbol='BTCUSDT', interval='5m', limit=1000):
-        klines = client.futures_klines(symbol=symbol, interval=interval, limit=limit)
-        df = pd.DataFrame(klines, columns=[
-            'timestamp', 'open', 'high', 'low', 'close', 'volume',
-            'close_time', 'quote_asset_volume', 'num_trades',
-            'taker_buy_base', 'taker_buy_quote', 'ignore'
-        ])
-        df['close'] = df['close'].astype(float)
-        return df
-
-    timeframes = ['15m', '1h']
-
-    for tf in timeframes:
-        print(f"\n==============================")
-        print(f"🕒 [{tf}] 타임프레임 모델 학습 시작")
-        print(f"==============================\n")
-        df = get_klines(interval=tf, limit=1000)
-        model_path = f"trend_model_xgb_{tf}.pkl"
-        train_trend_model(df, model_path=model_path)
+    for interval in intervals:
+        train_model(interval)

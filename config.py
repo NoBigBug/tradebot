@@ -6,3 +6,6 @@ BINANCE_API_SECRET = ''
 
 TELEGRAM_BOT_TOKEN = ''
 TELEGRAM_CHAT_ID = ''
+
+# 트레이딩 인터벌 설정 ('1m', '5m', '15m', '1h' 등)
+TRADING_INTERVAL = '15m'
