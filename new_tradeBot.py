@@ -79,7 +79,7 @@ def compute_rsi(series: pd.Series, period: int = 14):
     return rsi
 
 # 현재 시각 기준 다음 봉 마감까지 남은 시간 계산
-def get_next_bar_close_time(interval_str='15m', buffer_seconds=5):
+def get_next_bar_close_time(interval_str='5m', buffer_seconds=5):
     now = datetime.now(timezone.utc)
     interval_minutes = interval_to_minutes(interval_str)
 
@@ -793,6 +793,7 @@ async def start_bot():
 
         # 다음 봉 마감 시점 계산 (예: 현재 시각이 09:14:53 → 09:15:00 마감까지 7초 남음)
         sleep_sec = get_next_bar_close_time(TRADING_INTERVAL)
+        # sleep_sec = get_next_bar_close_time()
         logging.info(f"다음 봉 마감까지 {sleep_sec:.2f}초 대기...")
         await asyncio.sleep(sleep_sec)
 

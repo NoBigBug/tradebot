@@ -72,44 +72,50 @@ def label_trend(df: pd.DataFrame, future_window=10, threshold=0.8):
     return df.dropna()
 
 # 스마트 횡보 판별 기반 트렌드 라벨링
-def label_trend_smart(df: pd.DataFrame, future_window=10, threshold=0.8) -> pd.DataFrame:
+def label_trend_smart(df: pd.DataFrame, future_window=10, threshold=0.5) -> pd.DataFrame:
     df = df.copy()
 
-    # 미래 수익률 계산
+    # 기본 future return 계산
     df['future_return'] = df['close'].pct_change(periods=future_window).shift(-future_window)
 
-    # 기본 상승/하락/횡보 구분
+    # 기본 트렌드 라벨
     df['basic_trend'] = df['future_return'].apply(
         lambda x: 2 if x > threshold / 100 else (0 if x < -threshold / 100 else 1)
     )
 
-    # 추가적인 스마트 횡보 판별
-    # 볼린저 밴드 폭
+    # 기술 지표 계산
     df['ma20'] = df['close'].rolling(window=20).mean()
     df['std20'] = df['close'].rolling(window=20).std()
     df['bb_width'] = (2 * df['std20']) / df['ma20']
 
-    # 단기/장기 이평 간 거리
     df['ema9'] = df['close'].ewm(span=9).mean()
     df['ema21'] = df['close'].ewm(span=21).mean()
     df['ema_distance'] = abs(df['ema9'] - df['ema21']) / df['close']
 
-    # ADX 추세 강도
     adx_indicator = ADXIndicator(high=df['high'], low=df['low'], close=df['close'], window=14)
     df['adx'] = adx_indicator.adx()
 
-    # 스마트 횡보 조건
-    volatility_condition = df['bb_width'] < 0.01    # 볼린저 밴드 폭 1% 이내
-    ema_condition = df['ema_distance'] < 0.003       # 이평선 간 거리 0.3% 이내
-    adx_condition = df['adx'] < 20                   # ADX 20 이하 (추세 약함)
+    # 완화된 횡보 조건
+    volatility_condition = df['bb_width'] < 0.02
+    ema_condition = df['ema_distance'] < 0.005
+    adx_condition = df['adx'] < 15
 
     smart_consolidation = volatility_condition & ema_condition & adx_condition
 
-    # 최종 트렌드 결정
-    df['trend'] = df.apply(
-        lambda row: 1 if (row['basic_trend'] == 1 or smart_consolidation.loc[row.name]) else row['basic_trend'],
-        axis=1
-    )
+    # 최종 트렌드 결정 로직
+    def final_trend(row):
+        if abs(row['future_return']) > 0.015:  # 강한 수익률은 강제로 바꾸지 않음
+            return row['basic_trend']
+        if row['basic_trend'] == 1:
+            return 1  # 기본 횡보면 그냥 유지
+        elif row['basic_trend'] in [0, 2]:
+            return 1 if smart_consolidation.loc[row.name] else row['basic_trend']
+        else:
+            return row['basic_trend']
+
+    df['trend'] = df.apply(final_trend, axis=1)
+
+    print(df['trend'].value_counts(normalize=True))
 
     return df.dropna()
 
@@ -120,7 +126,7 @@ def train_model(interval='15m'):
 
     # 피처 및 라벨 생성
     df = compute_features(df)
-    df = label_trend_smart(df)
+    df = label_trend(df, threshold=0.3)
 
     # 사용 피처 정의
     features = [
@@ -130,6 +136,10 @@ def train_model(interval='15m'):
 
     X = df[features]
     y = df['trend']  # 0=하락, 1=횡보, 2=상승
+
+    # 클래스 분포 확인
+    print("\n[트렌드 라벨 분포]")
+    print(y.value_counts(normalize=True))
 
     # 학습/검증 데이터 분리
     X_train, X_test, y_train, y_test = train_test_split(
@@ -147,7 +157,7 @@ def train_model(interval='15m'):
         eval_metric='mlogloss',
         random_state=42,
         verbosity=0,
-        objective='multi:softprob',  # 다중 클래스 확률 출력
+        objective='multi:softprob',
         num_class=3,
         tree_method='hist',
         scale_pos_weight=1,
