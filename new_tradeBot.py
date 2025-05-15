@@ -8,15 +8,17 @@ import joblib
 import subprocess
 import os
 import csv
+import tweepy
 from sklearn.cluster import KMeans
 from telegram import Bot
 from telegram.request import HTTPXRequest
 from binance.client import Client
 from datetime import datetime, timedelta, timezone, time
+from textblob import TextBlob
 
 # 외부 설정파일 및 학습 함수 import
 from train_entry_strategy_model_from_csv import train_entry_strategy_from_csv
-from config import BINANCE_API_KEY, BINANCE_API_SECRET, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TRADING_INTERVAL
+from config import BINANCE_API_KEY, BINANCE_API_SECRET, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TRADING_INTERVAL, CRYPTO_PANIC_API_KEY, NEWS_KEYWORDS, TWITTER_BEARER_TOKEN, TWITTER_KEYWORDS
 
 # matplotlib 폰트 및 마이너스 깨짐 방지 설정
 mpl.rcParams['font.family'] = 'AppleGothic'
@@ -24,6 +26,11 @@ mpl.rcParams['axes.unicode_minus'] = False
 
 # Binance, Telegram 봇 클라이언트 생성
 client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
+client.API_URL = 'https://fapi.binance.com'  # 선물 주소 (이미 설정돼있을 것임)
+client.futures_time()  # 연결 테스트
+
+# 서버 시간과 동기화
+client.timestamp_offset = client.futures_time()['serverTime'] - int(datetime.now(timezone.utc).timestamp() * 1000)
 bot = Bot(token=TELEGRAM_BOT_TOKEN, request=HTTPXRequest(connect_timeout=10.0, read_timeout=10.0))
 
 # 포지션 및 거래 상태 전역 변수
@@ -33,8 +40,11 @@ entry_price = None     # 진입 가격
 bak_entry_price = None
 tp_order_id = None     # TP 주문 ID
 sl_order_id = None     # SL 주문 ID
-quantity = 0.05        # 거래 수량 (예: 0.05 BTC)
+quantity = 0.5        # 거래 수량 (예: 0.05 BTC)
 strategy_used_at_entry = None  # 0 = 역추세, 1 = 추세
+
+# 뉴스 감지
+latest_news_ids = set()
 
 # 전략 설정 (기본 TP/SL 및 리스크 제한)
 TP_PERCENT = 1.0        # 목표 수익률 (Take Profit)
@@ -55,8 +65,94 @@ KST = timezone(timedelta(hours=9))
 # 로깅 레벨 설정
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 
+async def monitor_twitter_loop():
+    logging.info("🐦 트위터 감시 루프 시작됨")
+
+    try:
+        stream = TwitterNewsStream(TWITTER_BEARER_TOKEN)
+
+        # 기존 규칙 제거 후 새로 등록
+        rules = stream.get_rules().data
+        if rules:
+            stream.delete_rules([r.id for r in rules])
+        stream.add_rules(tweepy.StreamRule(" OR ".join(TWITTER_KEYWORDS) + " lang:en -is:retweet"))
+
+        stream.filter(tweet_fields=["text"])
+    except Exception as e:
+        logging.error(f"❌ 트위터 스트리밍 실패: {e}")
+
+class TwitterNewsStream(tweepy.StreamingClient):
+    def on_tweet(self, tweet):
+        global volatility_blocked
+        text = tweet.text.lower()
+        if any(keyword in text for keyword in TWITTER_KEYWORDS):
+            sentiment = analyze_sentiment(text)
+            message = (
+                f"🐦 트윗 감지: {sentiment.upper()}\n\n"
+                f"{tweet.text[:300]}"
+            )
+            asyncio.create_task(send_telegram_message(message))
+
+            if sentiment == 'negative':
+                volatility_blocked = True
+                logging.warning("⚠️ 부정 트윗 감지 → 진입 차단")
+
+def analyze_sentiment(text):
+    blob = TextBlob(text)
+    polarity = blob.sentiment.polarity
+    if polarity > 0.1:
+        return 'positive'
+    elif polarity < -0.1:
+        return 'negative'
+    else:
+        return 'neutral'
+
+def fetch_latest_crypto_news():
+    url = f"https://cryptopanic.com/api/v1/posts/?auth_token={CRYPTO_PANIC_API_KEY}&currencies=ETH&public=true"
+    try:
+        response = requests.get(url, timeout=5)
+        data = response.json()
+        news_list = []
+        for item in data.get('results', []):
+            title = item.get('title', '').lower()
+            if any(keyword in title for keyword in NEWS_KEYWORDS):
+                news_list.append(item)
+        return news_list
+    except Exception as e:
+        logging.error(f"❌ 뉴스 가져오기 실패: {e}")
+        return []
+    
+async def monitor_news_loop():
+    global volatility_blocked, latest_news_ids
+    logging.info("📰 뉴스 감시 루프 시작됨")
+
+    while True:
+        try:
+            news_items = fetch_latest_crypto_news()
+            new_alerts = []
+
+            for news in news_items:
+                news_id = news['id']
+                if news_id not in latest_news_ids:
+                    latest_news_ids.add(news_id)
+                    new_alerts.append(news)
+
+            if new_alerts:
+                for news in new_alerts:
+                    title = news['title']
+                    url = news.get('url', '')
+                    await send_telegram_message(f"🚨 ETH 뉴스 감지!\n📰 {title}\n🔗 {url}")
+                # 일시적 거래 중단
+                volatility_blocked = True
+                logging.warning("⚠️ 뉴스 감지 → 변동성 위험 감지로 진입 중단")
+
+        except Exception as e:
+            logging.error(f"❌ 뉴스 감시 중 오류: {e}")
+
+        await asyncio.sleep(120)  # 2분 간격 확인
+
 # 바이낸스에서 캔들 데이터 불러오기
-def get_klines(symbol='BTCUSDT', interval=TRADING_INTERVAL, limit=1000):
+def get_klines(symbol='ETHUSDT', interval=TRADING_INTERVAL, limit=1000):
     klines = client.futures_klines(symbol=symbol, interval=interval, limit=limit)
     df = pd.DataFrame(klines, columns=[
         'timestamp', 'open', 'high', 'low', 'close', 'volume',
@@ -326,7 +422,7 @@ async def maybe_retrain_entry_strategy():
 
                 # 캔들 데이터 가져오기
                 limit = get_auto_limit(interval=interval)
-                df = get_klines(symbol='BTCUSDT', interval=interval, limit=limit)
+                df = get_klines(symbol='ETHUSDT', interval=interval, limit=limit)
 
                 # 학습 데이터셋 생성
                 dataset = generate_entry_strategy_dataset(df, trend_model_path=f"trend_model_xgb_{interval}.pkl")
@@ -419,7 +515,7 @@ def analyze_volatility(df):
  
 def place_order(side: str, quantity: float):
     order = client.futures_create_order(
-        symbol='BTCUSDT',
+        symbol='ETHUSDT',
         side='BUY' if side == 'long' else 'SELL',
         type='MARKET',
         quantity=quantity
@@ -429,14 +525,14 @@ def place_order(side: str, quantity: float):
 def close_position(current_side: str, quantity: float):
     close_side = 'SELL' if current_side == 'long' else 'BUY'
     order = client.futures_create_order(
-        symbol='BTCUSDT',
+        symbol='ETHUSDT',
         side=close_side,
         type='MARKET',
         quantity=quantity
     )
     return order
 
-def get_tick_size(symbol='BTCUSDT'):
+def get_tick_size(symbol='ETHUSDT'):
     info = client.futures_exchange_info()
     for s in info['symbols']:
         if s['symbol'] == symbol:
@@ -449,7 +545,7 @@ def round_to_tick(price, tick_size):
     return round(round(price / tick_size) * tick_size, 8)
 
 def place_tp_sl_orders(entry_price: float, side: str, quantity: float):
-    tick_size = get_tick_size('BTCUSDT')
+    tick_size = get_tick_size('ETHUSDT')
 
     tp_price = entry_price * (1 + TP_PERCENT / 100) if side == 'long' else entry_price * (1 - TP_PERCENT / 100)
     sl_price = entry_price * (1 - SL_PERCENT / 100) if side == 'long' else entry_price * (1 + SL_PERCENT / 100)
@@ -458,7 +554,7 @@ def place_tp_sl_orders(entry_price: float, side: str, quantity: float):
     sl_price = str(round_to_tick(sl_price, tick_size))
 
     tp_order = client.futures_create_order(
-        symbol='BTCUSDT',
+        symbol='ETHUSDT',
         side='SELL' if side == 'long' else 'BUY',
         type='LIMIT',
         price=tp_price,
@@ -468,7 +564,7 @@ def place_tp_sl_orders(entry_price: float, side: str, quantity: float):
     )
 
     sl_order = client.futures_create_order(
-        symbol='BTCUSDT',
+        symbol='ETHUSDT',
         side='SELL' if side == 'long' else 'BUY',
         type='STOP_MARKET',
         stopPrice=sl_price,
@@ -488,7 +584,7 @@ def cancel_order(symbol: str):
 async def send_telegram_message(message: str):
     await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
 
-def get_current_position(symbol='BTCUSDT'):
+def get_current_position(symbol='ETHUSDT'):
     positions = client.futures_position_information(symbol=symbol)
     for p in positions:
         pos_amt = float(p['positionAmt'])
@@ -498,7 +594,7 @@ def get_current_position(symbol='BTCUSDT'):
             return side, entry_price
     return None, None
 
-def check_existing_tp_sl_orders(symbol='BTCUSDT'):
+def check_existing_tp_sl_orders(symbol='ETHUSDT'):
     open_orders = client.futures_get_open_orders(symbol=symbol)
     tp_exists = any(o['type'] == 'LIMIT' and o['reduceOnly'] for o in open_orders)
     sl_exists = any(o['type'] == 'STOP_MARKET' and o['reduceOnly'] for o in open_orders)
@@ -547,7 +643,7 @@ async def multi_tf_trading_loop():
     global TP_PERCENT, SL_PERCENT, last_reset_month, tp_order_id, sl_order_id
 
     # 심볼 선택(추후에는 여러 코인으로 확장)
-    symbol = 'BTCUSDT'
+    symbol = 'ETHUSDT'
     
     support = None
     resistance = None
@@ -606,33 +702,6 @@ async def multi_tf_trading_loop():
 
             await asyncio.sleep(1.5)
             logging.info("✅ 포지션 종료 후 상태 초기화 및 대기 완료")
-        else:
-            should_exit, exit_reason = await check_should_exit(
-                symbol=symbol,
-                interval=TRADING_INTERVAL,
-                entry_price=entry_price,
-                strategy=strategy_used_at_entry,
-                position_state=position_state
-            )
-
-            if should_exit:
-                cancel_order(symbol)
-                close_position(position_state, quantity)
-                cumulative_pnl += change_pct
-
-                await send_telegram_message(
-                    f"🚨 전략 조건 변경으로 포지션 종료\n{exit_reason}\n"
-                    f"📈 종료 PnL: {change_pct:.2f}% | 누적: {cumulative_pnl:.2f}%"
-                )
-
-                position_state = None
-                entry_price = None
-                strategy_used_at_entry = None  # 전략 상태도 초기화
-                tp_order_id = None
-                sl_order_id = None
-
-                await asyncio.sleep(1.0)
-                return
 
     if cumulative_pnl <= STOP_LOSS_LIMIT:
         await send_telegram_message(f"🛑 누적 손실 {cumulative_pnl:.2f}%로 자동 중단됩니다.")
@@ -787,13 +856,20 @@ async def start_bot():
     await send_telegram_message(f"트레이딩봇 시작.")
     logging.info("프로그램 시작됨. 다음 봉 마감까지 대기 중...")
 
+    # 뉴스 감지 루프 및 트레이딩 루프 동시 실행
+    await asyncio.gather(
+        monitor_news_loop(),        # 뉴스 API 감시
+        monitor_twitter_loop(),     # 트위터 감시
+        trading_loop_wrapper()      # 기존 트레이딩 루프
+    )
+
+async def trading_loop_wrapper():
     while True:
-        await maybe_retrain_daily()                # 기존 trend 모델 재학습
-        await maybe_retrain_entry_strategy()       # 새로운 entry 전략 모델 재학습    
+        await maybe_retrain_daily()             # 기존 trend 모델 재학습
+        await maybe_retrain_entry_strategy()    # 새로운 entry 전략 모델 재학습 
 
         # 다음 봉 마감 시점 계산 (예: 현재 시각이 09:14:53 → 09:15:00 마감까지 7초 남음)
         sleep_sec = get_next_bar_close_time(TRADING_INTERVAL)
-        # sleep_sec = get_next_bar_close_time()
         logging.info(f"다음 봉 마감까지 {sleep_sec:.2f}초 대기...")
         await asyncio.sleep(sleep_sec)
 
@@ -882,7 +958,7 @@ async def backtest_bot(interval='15m', isLogShow=True) -> float:
     bak_cumulative_pnl = 0.0
     bak_strategy_used_at_entry = None
 
-    df = get_klines(symbol='BTCUSDT', interval=interval, limit=1000)
+    df = get_klines(symbol='ETHUSDT', interval=interval, limit=1000)
     trend_model_path = f"trend_model_xgb_{interval}.pkl"
     entry_model_path = f"entry_strategy_model_{interval}.pkl"
     entry_model = joblib.load(entry_model_path)
@@ -996,7 +1072,7 @@ async def test_backtest_bot(interval='15m', isLogShow=True) -> float:
     bak_tp_order_id = None
     bak_sl_order_id = None
 
-    df = get_klines(symbol='BTCUSDT', interval=interval, limit=1000)
+    df = get_klines(symbol='ETHUSDT', interval=interval, limit=1000)
     trend_model_path = f"trend_model_xgb_{interval}.pkl"
     entry_model_path = f"entry_strategy_model_{interval}.pkl"
     entry_model = joblib.load(entry_model_path)

@@ -10,7 +10,7 @@ from new_tradeBot import (
 client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
 
 def save_entry_strategy_dataset_csv(
-    symbol='BTCUSDT',
+    symbol='ETHUSDT',
     interval=TRADING_INTERVAL,
     trend_model_path=None,
     output_csv=None

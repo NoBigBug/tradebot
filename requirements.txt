@@ -4,3 +4,5 @@ numpy
 matplotlib
 scikit-learn
 python-telegram-bot
+tweepy
+textblob
