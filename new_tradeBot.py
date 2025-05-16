@@ -7,14 +7,22 @@ import logging
 import joblib
 import subprocess
 import os
+import json
 import csv
 import tweepy
+import requests
+import nltk
+
+nltk.download('vader_lexicon')
+
 from sklearn.cluster import KMeans
 from telegram import Bot
 from telegram.request import HTTPXRequest
 from binance.client import Client
 from datetime import datetime, timedelta, timezone, time
 from textblob import TextBlob
+from collections import deque
+from nltk.sentiment.vader import SentimentIntensityAnalyzer
 
 # 외부 설정파일 및 학습 함수 import
 from train_entry_strategy_model_from_csv import train_entry_strategy_from_csv
@@ -46,6 +54,12 @@ strategy_used_at_entry = None  # 0 = 역추세, 1 = 추세
 # 뉴스 감지
 latest_news_ids = set()
 
+# 감정 분석기 초기화 (전역)
+vader = SentimentIntensityAnalyzer()
+
+# 최근 감정 로그 저장용 (최대 100개)
+sentiment_log = deque(maxlen=100)
+
 # 전략 설정 (기본 TP/SL 및 리스크 제한)
 TP_PERCENT = 1.0        # 목표 수익률 (Take Profit)
 BAK_TP_PERCENT = 1.0 
@@ -59,11 +73,69 @@ bak_cumulative_pnl = 0.0
 STOP_LOSS_LIMIT = -10.0     # 누적 손실 한계 (이하일 경우 중단)
 last_reset_month = datetime.now().month
 
+NEWS_API_LIMIT = 900  # 무료 요금제 기준
+
 # 시간대 설정 (KST: 한국 시간)
 KST = timezone(timedelta(hours=9))
 
+API_USAGE_PATH = "api_usage.json"
+# 기본값
+api_usage = {
+    "date": datetime.now().strftime("%Y-%m-%d"),
+    "news_calls": 0,
+    "twitter_calls": 0
+}
+
 # 로깅 레벨 설정
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+
+# ==================================
+def load_api_usage():
+    global api_usage
+    if os.path.exists(API_USAGE_PATH):
+        try:
+            with open(API_USAGE_PATH, "r") as f:
+                api_usage = json.load(f)
+        except Exception as e:
+            logging.warning(f"⚠️ API 사용량 로드 실패: {e}")
+
+def save_api_usage():
+    try:
+        with open(API_USAGE_PATH, "w") as f:
+            json.dump(api_usage, f)
+    except Exception as e:
+        logging.warning(f"⚠️ API 사용량 저장 실패: {e}")
+
+def check_and_increment_api_calls(api_type: str, limit: int) -> bool:
+    global api_usage
+
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    if api_usage["date"] != today_str:
+        # 날짜 변경 시 초기화
+        api_usage = {
+            "date": today_str,
+            "news_calls": 0,
+            "twitter_calls": 0
+        }
+
+    key = f"{api_type}_calls"
+    if api_usage.get(key, 0) >= limit:
+        logging.warning(f"🚫 {api_type.upper()} API 호출 한도 도달 → 호출 차단")
+        return False
+
+    api_usage[key] = api_usage.get(key, 0) + 1
+    save_api_usage()
+    return True
+# =================================
+# 감정 점수 기록 함수
+def log_sentiment(polarity, timestamp=None):
+    timestamp = timestamp or datetime.now(timezone.utc)
+    sentiment_log.append((timestamp, polarity))
+
+def get_recent_sentiment_score(window_minutes=30):
+    now = datetime.now(timezone.utc)
+    scores = [score for ts, score in sentiment_log if (now - ts).total_seconds() <= window_minutes * 60]
+    return np.mean(scores) if scores else 0.0  # 기본값 중립
 
 async def monitor_twitter_loop():
     logging.info("🐦 트위터 감시 루프 시작됨")
@@ -84,18 +156,32 @@ async def monitor_twitter_loop():
 class TwitterNewsStream(tweepy.StreamingClient):
     def on_tweet(self, tweet):
         global volatility_blocked
+
         text = tweet.text.lower()
         if any(keyword in text for keyword in TWITTER_KEYWORDS):
-            sentiment = analyze_sentiment(text)
-            message = (
-                f"🐦 트윗 감지: {sentiment.upper()}\n\n"
-                f"{tweet.text[:300]}"
-            )
-            asyncio.create_task(send_telegram_message(message))
+            try:
+                score = vader.polarity_scores(text)['compound']
+            except Exception as e:
+                logging.warning(f"❌ 트윗 감정 분석 실패: {e}")
+                return
 
-            if sentiment == 'negative':
-                volatility_blocked = True
-                logging.warning("⚠️ 부정 트윗 감지 → 진입 차단")
+            if score == 0.0:
+                return  # 감정 없음 → 무시
+
+            log_sentiment(score)
+
+            sentiment_label = (
+                "긍정" if score >= 0.05 else
+                "부정" if score <= -0.05 else
+                "중립"
+            )
+
+            asyncio.create_task(send_telegram_message(
+                f"🐦 트윗 감지: {sentiment_label.upper()} ({score:+.3f})\n\n{text[:300]}"
+            ))
+
+            if score <= -0.2 or score >= 0.5:  # ⚠️ 기준값은 조정 가능
+                logging.warning(f"⚠️ {sentiment_label.upper()} 트윗 감지 → 감정 기반 경고 (전략 영향 가능)")
 
 def analyze_sentiment(text):
     blob = TextBlob(text)
@@ -127,6 +213,11 @@ async def monitor_news_loop():
     logging.info("📰 뉴스 감시 루프 시작됨")
 
     while True:
+        if not check_and_increment_api_calls("news", NEWS_API_LIMIT):
+            await send_telegram_message("📛 뉴스 API 호출 한도 초과로 감시 일시 중단됨")
+            await asyncio.sleep(600)  # 10분 후 재시도
+            continue
+
         try:
             news_items = fetch_latest_crypto_news()
             new_alerts = []
@@ -141,11 +232,33 @@ async def monitor_news_loop():
                 for news in new_alerts:
                     title = news['title']
                     url = news.get('url', '')
-                    await send_telegram_message(f"🚨 ETH 뉴스 감지!\n📰 {title}\n🔗 {url}")
-                # 일시적 거래 중단
-                volatility_blocked = True
-                logging.warning("⚠️ 뉴스 감지 → 변동성 위험 감지로 진입 중단")
+                    content = title + " " + news.get('description', '')
 
+                    try:
+                        # VADER 감정 분석
+                        score = vader.polarity_scores(content)['compound']
+                    except Exception as e:
+                        logging.warning(f"❌ 감정 분석 실패: {e}")
+                        continue
+
+                    if score == 0.0:
+                        continue  # 감정 없음 → 무시
+
+                    log_sentiment(score)
+
+                    sentiment_label = (
+                        "긍정" if score >= 0.05 else
+                        "부정" if score <= -0.05 else
+                        "중립"
+                    )
+
+                    # 조건부 경고만 표시
+                    if score <= -0.2 or score >= 0.5:
+                        await send_telegram_message(
+                            f"🚨 ETH 뉴스 감지!\n📰 {title}\n🔗 {url}\n🧠 감정 점수: {sentiment_label.upper()}({score:+.3f})"
+                        )
+                        logging.warning(f"⚠️ {sentiment_label.upper()} 뉴스 감지 → 감정 기반 경고 (전략 영향 가능)")
+                    
         except Exception as e:
             logging.error(f"❌ 뉴스 감시 중 오류: {e}")
 
@@ -350,6 +463,8 @@ def generate_entry_strategy_dataset(df: pd.DataFrame, trend_model_path: str, fut
         # 라벨 결정: 누가 더 나은 수익률을 냈는가?
         label = 1 if pnl_trend > pnl_counter else 0
 
+        sentiment_score = get_recent_sentiment_score()
+
         data.append({
             'ma_ratio': row['ma_ratio'],
             'volatility': row['volatility'],
@@ -365,6 +480,7 @@ def generate_entry_strategy_dataset(df: pd.DataFrame, trend_model_path: str, fut
             'dist_resistance': resistance_dist,
             'trend': trend,
             'confidence': confidence,
+            'sentiment_score': sentiment_score,
             'label': label
         })
 
@@ -856,8 +972,10 @@ async def start_bot():
     await send_telegram_message(f"트레이딩봇 시작.")
     logging.info("프로그램 시작됨. 다음 봉 마감까지 대기 중...")
 
+    load_api_usage()
+
     # 뉴스 감지 루프 및 트레이딩 루프 동시 실행
-    await asyncio.gather(
+    await asyncio.gather(    
         monitor_news_loop(),        # 뉴스 API 감시
         monitor_twitter_loop(),     # 트위터 감시
         trading_loop_wrapper()      # 기존 트레이딩 루프

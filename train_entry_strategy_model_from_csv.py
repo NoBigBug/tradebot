@@ -1,6 +1,7 @@
 import pandas as pd
 import joblib
-from xgboost import XGBClassifier, plot_importance
+
+from xgboost import XGBClassifier
 from sklearn.model_selection import train_test_split, cross_val_score
 from sklearn.metrics import classification_report
 from sklearn.utils.class_weight import compute_sample_weight
@@ -30,6 +31,20 @@ def train_entry_strategy_from_csv(
     label_counts = df['label'].value_counts()
     if label_counts.min() < 2:
         print(f"레이블 불균형 (0: {label_counts.get(0,0)}개, 1: {label_counts.get(1,0)}개) → 학습 스킵")
+        return
+    
+    # 사용할 피처 명시적으로 정의 (감정 포함)
+    feature_cols = [
+        'ma_ratio', 'volatility', 'rsi', 'macd', 'macd_signal',
+        'bb_width', 'ema_ratio_9_21', 'adx', 'atr', 'stoch_k',
+        'dist_support', 'dist_resistance', 'trend', 'confidence',
+        'sentiment_score'
+    ]
+
+    # 누락된 피처 확인
+    missing_cols = [col for col in feature_cols if col not in df.columns]
+    if missing_cols:
+        print(f"❌ 다음 필수 컬럼이 누락됨: {missing_cols}")
         return
 
     X = df.drop(columns=['label'])
