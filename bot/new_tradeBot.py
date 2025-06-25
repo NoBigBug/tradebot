@@ -194,19 +194,21 @@ def analyze_sentiment(text):
         return 'neutral'
 
 def fetch_latest_crypto_news():
-    url = f"https://cryptopanic.com/api/v1/posts/?auth_token={CRYPTO_PANIC_API_KEY}&currencies=ETH&public=true"
     try:
-        response = requests.get(url, timeout=5)
-        data = response.json()
-        news_list = []
-        for item in data.get('results', []):
-            title = item.get('title', '').lower()
-            if any(keyword in title for keyword in NEWS_KEYWORDS):
-                news_list.append(item)
-        return news_list
-    except Exception as e:
-        logging.error(f"❌ 뉴스 가져오기 실패: {e}")
-        return []
+        url = f"https://cryptopanic.com/api/v1/posts/?auth_token={CRYPTO_PANIC_API_KEY}&currencies=ETH&kind=news"
+        response = requests.get(url, timeout=10)
+
+        if response.status_code != 200:
+            logging.warning(f"🛑 뉴스 API 호출 실패 - 상태코드: {response.status_code}")
+            return []
+
+        return response.json().get("results", [])
+
+    except requests.exceptions.JSONDecodeError:
+        logging.error("❌ JSON 디코딩 실패 - 응답이 JSON이 아님")
+    except requests.exceptions.RequestException as e:
+        logging.error(f"❌ 뉴스 요청 실패: {e}")
+    return []
     
 async def monitor_news_loop():
     global volatility_blocked, latest_news_ids
@@ -265,7 +267,7 @@ async def monitor_news_loop():
         await asyncio.sleep(120)  # 2분 간격 확인
 
 # 바이낸스에서 캔들 데이터 불러오기
-def get_klines(symbol='ETHUSDT', interval=TRADING_INTERVAL, limit=1000):
+def get_klines(symbol='BTCUSDT', interval=TRADING_INTERVAL, limit=1000):
     klines = client.futures_klines(symbol=symbol, interval=interval, limit=limit)
     df = pd.DataFrame(klines, columns=[
         'timestamp', 'open', 'high', 'low', 'close', 'volume',
@@ -538,7 +540,7 @@ async def maybe_retrain_entry_strategy():
 
                 # 캔들 데이터 가져오기
                 limit = get_auto_limit(interval=interval)
-                df = get_klines(symbol='ETHUSDT', interval=interval, limit=limit)
+                df = get_klines(symbol='BTCUSDT', interval=interval, limit=limit)
 
                 # 학습 데이터셋 생성
                 dataset = generate_entry_strategy_dataset(df, trend_model_path=f"trend_model_xgb_{interval}.pkl")
@@ -631,7 +633,7 @@ def analyze_volatility(df):
  
 def place_order(side: str, quantity: float):
     order = client.futures_create_order(
-        symbol='ETHUSDT',
+        symbol='BTCUSDT',
         side='BUY' if side == 'long' else 'SELL',
         type='MARKET',
         quantity=quantity
@@ -641,14 +643,14 @@ def place_order(side: str, quantity: float):
 def close_position(current_side: str, quantity: float):
     close_side = 'SELL' if current_side == 'long' else 'BUY'
     order = client.futures_create_order(
-        symbol='ETHUSDT',
+        symbol='BTCUSDT',
         side=close_side,
         type='MARKET',
         quantity=quantity
     )
     return order
 
-def get_tick_size(symbol='ETHUSDT'):
+def get_tick_size(symbol='BTCUSDT'):
     info = client.futures_exchange_info()
     for s in info['symbols']:
         if s['symbol'] == symbol:
@@ -661,7 +663,7 @@ def round_to_tick(price, tick_size):
     return round(round(price / tick_size) * tick_size, 8)
 
 def place_tp_sl_orders(entry_price: float, side: str, quantity: float):
-    tick_size = get_tick_size('ETHUSDT')
+    tick_size = get_tick_size('BTCUSDT')
 
     tp_price = entry_price * (1 + TP_PERCENT / 100) if side == 'long' else entry_price * (1 - TP_PERCENT / 100)
     sl_price = entry_price * (1 - SL_PERCENT / 100) if side == 'long' else entry_price * (1 + SL_PERCENT / 100)
@@ -670,7 +672,7 @@ def place_tp_sl_orders(entry_price: float, side: str, quantity: float):
     sl_price = str(round_to_tick(sl_price, tick_size))
 
     tp_order = client.futures_create_order(
-        symbol='ETHUSDT',
+        symbol='BTCUSDT',
         side='SELL' if side == 'long' else 'BUY',
         type='LIMIT',
         price=tp_price,
@@ -680,7 +682,7 @@ def place_tp_sl_orders(entry_price: float, side: str, quantity: float):
     )
 
     sl_order = client.futures_create_order(
-        symbol='ETHUSDT',
+        symbol='BTCUSDT',
         side='SELL' if side == 'long' else 'BUY',
         type='STOP_MARKET',
         stopPrice=sl_price,
@@ -700,7 +702,7 @@ def cancel_order(symbol: str):
 async def send_telegram_message(message: str):
     await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
 
-def get_current_position(symbol='ETHUSDT'):
+def get_current_position(symbol='BTCUSDT'):
     positions = client.futures_position_information(symbol=symbol)
     for p in positions:
         pos_amt = float(p['positionAmt'])
@@ -710,7 +712,7 @@ def get_current_position(symbol='ETHUSDT'):
             return side, entry_price
     return None, None
 
-def check_existing_tp_sl_orders(symbol='ETHUSDT'):
+def check_existing_tp_sl_orders(symbol='BTCUSDT'):
     open_orders = client.futures_get_open_orders(symbol=symbol)
     tp_exists = any(o['type'] == 'LIMIT' and o['reduceOnly'] for o in open_orders)
     sl_exists = any(o['type'] == 'STOP_MARKET' and o['reduceOnly'] for o in open_orders)
@@ -759,7 +761,7 @@ async def multi_tf_trading_loop():
     global TP_PERCENT, SL_PERCENT, last_reset_month, tp_order_id, sl_order_id
 
     # 심볼 선택(추후에는 여러 코인으로 확장)
-    symbol = 'ETHUSDT'
+    symbol = 'BTCUSDT'
     
     support = None
     resistance = None
@@ -1076,7 +1078,7 @@ async def backtest_bot(interval='15m', isLogShow=True) -> float:
     bak_cumulative_pnl = 0.0
     bak_strategy_used_at_entry = None
 
-    df = get_klines(symbol='ETHUSDT', interval=interval, limit=1000)
+    df = get_klines(symbol='BTCUSDT', interval=interval, limit=1000)
     trend_model_path = f"trend_model_xgb_{interval}.pkl"
     entry_model_path = f"entry_strategy_model_{interval}.pkl"
     entry_model = joblib.load(entry_model_path)
@@ -1190,7 +1192,7 @@ async def test_backtest_bot(interval='15m', isLogShow=True) -> float:
     bak_tp_order_id = None
     bak_sl_order_id = None
 
-    df = get_klines(symbol='ETHUSDT', interval=interval, limit=1000)
+    df = get_klines(symbol='BTCUSDT', interval=interval, limit=1000)
     trend_model_path = f"trend_model_xgb_{interval}.pkl"
     entry_model_path = f"entry_strategy_model_{interval}.pkl"
     entry_model = joblib.load(entry_model_path)
@@ -1304,10 +1306,11 @@ async def test_backtest_bot(interval='15m', isLogShow=True) -> float:
     return bak_cumulative_pnl
 
 if __name__ == "__main__":
-    mode = input("실행 모드 선택 (live / backtest / all_backtest): ").strip()
-    if mode == "live":
-        asyncio.run(start_bot())
-    elif mode == "backtest":
-        asyncio.run(backtest_bot(interval=TRADING_INTERVAL))
-    elif mode == "all_backtest":
-        asyncio.run(run_all_backtests())
+    logging.info("봇실행됨.")
+    # mode = input("실행 모드 선택 (live / backtest / all_backtest): ").strip()
+    # if mode == "live":
+    #     asyncio.run(start_bot())
+    # elif mode == "backtest":
+    #     asyncio.run(backtest_bot(interval=TRADING_INTERVAL))
+    # elif mode == "all_backtest":
+    #     asyncio.run(run_all_backtests())

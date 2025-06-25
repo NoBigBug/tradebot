@@ -6,7 +6,7 @@ from config import BINANCE_API_KEY, BINANCE_API_SECRET, TRADING_INTERVAL
 client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
 
 # 데이터 수집 함수
-def get_klines(symbol='ETHUSDT', interval=TRADING_INTERVAL, limit=1000):
+def get_klines(symbol='BTCUSDT', interval=TRADING_INTERVAL, limit=1000):
     klines = client.futures_klines(symbol=symbol, interval=interval, limit=limit)
     df = pd.DataFrame(klines, columns=[
         'timestamp', 'open', 'high', 'low', 'close', 'volume',
@@ -18,7 +18,7 @@ def get_klines(symbol='ETHUSDT', interval=TRADING_INTERVAL, limit=1000):
     return df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
 
 # 저장 함수
-def save_training_data(interval=TRADING_INTERVAL, symbol='ETHUSDT', limit=1000):
+def save_training_data(interval=TRADING_INTERVAL, symbol='BTCUSDT', limit=1000):
     df = get_klines(symbol=symbol, interval=interval, limit=limit)
     filename = f"trend_training_data_{interval}.csv"
     df.to_csv(filename, index=False)
@@ -28,4 +28,4 @@ if __name__ == "__main__":
     intervals = ['15m', '1h']
 
     for interval in intervals:
-        save_training_data(interval=interval, symbol='ETHUSDT', limit=1000)
+        save_training_data(interval=interval, symbol='BTCUSDT', limit=1000)

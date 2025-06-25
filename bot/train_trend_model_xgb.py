@@ -128,6 +128,7 @@ def train_model(interval='15m'):
     df = compute_features(df)
     df = label_trend(df, threshold=0.3)
 
+
     # 사용 피처 정의
     features = [
         'ma_ratio', 'volatility', 'rsi', 'macd', 'macd_signal', 'bb_width',
@@ -154,7 +155,7 @@ def train_model(interval='15m'):
         subsample=0.9,
         colsample_bytree=0.9,
         use_label_encoder=False,
-        eval_metric='mlogloss',
+        eval_metric='mlogloss', 
         random_state=42,
         verbosity=0,
         objective='multi:softprob',
